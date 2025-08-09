@@ -48,6 +48,7 @@ def train(args, data, models, optimizer, lr_scheduler):
         loss_prior_sum = 0.0 # prior loss의 누적합 -> 평균 구할 때 쓰임
 
         for index, (fmri_vol, image) in enumerate(data): # enumerate: index와 값을 같이 반환
+            
             # global step 계산
             global_step = epoch * len(data) + index
             

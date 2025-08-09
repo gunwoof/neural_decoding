@@ -1,6 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 from torchvision import transforms
+from omegaconf import OmegaConf
 
 # for high-level image 
 from pretrained_cache.generative_models.sgm.modules.encoders.modules import FrozenOpenCLIPImageEmbedder # ViT/bigG
@@ -17,6 +19,7 @@ from dalle2_pytorch.dalle2_pytorch import l2norm, default, exists, RotaryEmbeddi
 # for caption
 from pretrained_cache.BrainCaptioning.modeling_git import GitForCausalLMClipEmb # caption token 생성
 from transformers import AutoProcessor # (caption token -> english) 변환
+from pretrained_cache.generative_models.sgm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder2 # SDXL이 text condition을 2개의 embedding으로 받음
 
 # for SDXL
 from pretrained_cache.generative_models.sgm.models.diffusion import DiffusionEngine
@@ -332,10 +335,10 @@ class FlaggedCausalTransformer(nn.Module):
         out = self.norm(x)
         return self.project_out(out)
 
-# nCLIP ViT/bigG-14[batch, 256, 1664] -> CLIP ViT/L-14[batch, 257, 1024]
+# CLIP ViT/bigG-14[batch, 256, 1664] -> CLIP ViT/L-14[batch, 257, 1024]
 class CLIPConverter(torch.nn.Module):
     def __init__(self):
-        super(CLIPConverter, self).__init__()
+        super().__init__()
         self.linear1 = nn.Linear(256, 257)
         self.linear2 = nn.Linear(1664, 1024)
     def forward(self, x): 
@@ -346,10 +349,15 @@ class CLIPConverter(torch.nn.Module):
         x = self.linear1(x)
         x = self.linear2(x.permute(0,2,1))
         return x
+
+# 학습하는 모델을 담을 class
+class MindEyeModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x
     
 def get_model(args):
-
-    num_voxels_list = [15724, 14278, 13039, 12682]
 
     #### image clip 정의 ####
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
@@ -359,11 +367,15 @@ def get_model(args):
         only_tokens=True,
     )
 
+    #### 학습하는 모델을 담을 객체 ####
+    mindeye2 = MindEyeModule()
+        
     #### ridge(Shared-subject latent space) 정의 ####
-    ridge = RidgeRegression(num_voxels_list=num_voxels_list, out_features=4096).to(args.device)
+    num_voxels_list = [15724, 14278, 13039, 12682] # subject 1,2,5,7
+    mindeye2.ridge = RidgeRegression(num_voxels_list=num_voxels_list, out_features=4096).to(args.device)
 
     #### Residual MLP backbone 정의 ####
-    backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664).to(args.device)
+    mindeye2.backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664).to(args.device)
 
     #### difussion prior 정의 ####
     clip_seq_dim = 256
@@ -383,7 +395,7 @@ def get_model(args):
             learned_query_mode="pos_emb"
     ).to(args.device)
 
-    diffusion_prior = BrainDiffusionPrior(
+    mindeye2.diffusion_prior = BrainDiffusionPrior(
         net=prior_network,
         image_embed_dim=out_dim,
         condition_on_text_encodings=False,
@@ -393,7 +405,113 @@ def get_model(args):
     ).to(args.device)
 
     #### low-level 정의 ####
+    #### encoder & decoder 정의 ####
+    try:
+        # 전체 pipeline 로컬에서 로드
+        sd_model_dir = os.path.join(args.cache_dir, "models--lambdalabs--sd-image-variations-diffusers", "snapshots")
+        snapshot_name = os.listdir(sd_model_dir)  # 첫 snapshot
+        snapshot_path = os.path.join(sd_model_dir, snapshot_name[0])
+
+        sd_pipe = DiffusionPipeline.from_pretrained(snapshot_path)
+    except Exception as e:
+        print(f"[!] 로컬 snapshot 로딩 실패, 온라인에서 전체 모델 로드: {e}")
+        sd_pipe = DiffusionPipeline.from_pretrained("lambdalabs/sd-image-variations-diffusers", cache_dir=args.cache_dir)
+
+    # 학습 비활성화
+    sd_pipe.vae.eval().requires_grad_(False)
+    
+    vae = sd_pipe.vae
+    noise_scheduler = sd_pipe.scheduler
+
+    # convnext + mlp 정의(loss에서만 사용)
+    cnx_path = os.path.join(args.cache_dir, "convnext_xlarge_alpha0.75_fullckpt.pth")
+    cnx = ConvnextXL(cnx_path)
+    cnx.requires_grad_(False)
+    cnx.eval()
+
+    # L1 loss
+    l1 = nn.L1Loss()
 
     #### caption 정의 ####
+    clip_linear = CLIPConverter() # CLIP ViT/bigG-14[batch, 256, 1664] -> CLIP ViT/L-14[batch, 257, 1024]
+    clip_text_model = GitForCausalLMClipEmb.from_pretrained("microsoft/git-large-coco") # caption token 생성
+    token_to_text = AutoProcessor.from_pretrained("microsoft/git-large-coco") # (caption token -> english) 변환
 
     #### reconstruction 정의 ####
+    # config 정의
+    config = OmegaConf.load("pretrained_cache/generative_models/configs/inference/sd_xl_base.yaml") # yaml불러오기
+    config = OmegaConf.to_container(config, resolve=True) # yaml dic으로 변환
+    refiner_params = config["model"]["params"]
+    network_config = refiner_params["network_config"]
+    denoiser_config = refiner_params["denoiser_config"]
+    first_stage_config = refiner_params["first_stage_config"]
+    conditioner_config = refiner_params["conditioner_config"]
+    scale_factor = refiner_params["scale_factor"]
+    disable_first_stage_autocast = refiner_params["disable_first_stage_autocast"]
+
+    config = OmegaConf.load("generative_models/configs/unclip6.yaml") # yaml불러오기
+    config = OmegaConf.to_container(config, resolve=True) # yaml dic으로 변환
+    unclip_params = config["model"]["params"]
+    sampler_config = unclip_params["sampler_config"]
+    sampler_config['params']['num_steps'] = 38
+
+    # caption을 text embedding으로 변환
+    base_text_embedder1 = FrozenCLIPEmbedder(
+    layer=conditioner_config['params']['emb_models'][0]['params']['layer'],
+    layer_idx=conditioner_config['params']['emb_models'][0]['params']['layer_idx'],
+    )
+    base_text_embedder2 = FrozenOpenCLIPEmbedder2(
+        arch=conditioner_config['params']['emb_models'][1]['params']['arch'],
+        version=conditioner_config['params']['emb_models'][1]['params']['version'],
+        freeze=conditioner_config['params']['emb_models'][1]['params']['freeze'],
+        layer=conditioner_config['params']['emb_models'][1]['params']['layer'],
+        always_return_pooled=conditioner_config['params']['emb_models'][1]['params']['always_return_pooled'],
+        legacy=conditioner_config['params']['emb_models'][1]['params']['legacy'],
+    )
+
+    # sdxl 정의
+    sdxl_path = os.path.join(args.cache_dir, "generative_models", "zavychromaxl_v30.safetensors")
+    sdxl = DiffusionEngine(network_config=network_config,
+                       denoiser_config=denoiser_config,
+                       first_stage_config=first_stage_config,
+                       conditioner_config=conditioner_config,
+                       sampler_config=sampler_config, # using the one defined by the unclip
+                       scale_factor=scale_factor,
+                       disable_first_stage_autocast=disable_first_stage_autocast,
+                       ckpt_path=sdxl_path)
+    sdxl.eval().requires_grad_(False)
+
+    # sdxl unclip 정의
+    first_stage_config['target'] = 'sgm.models.autoencoder.AutoencoderKL'
+    sdxl_unclip_path = os.path.join(args.cache_dir, "generative_models", "unclip6_epoch0_step110000.ckpt")
+    sdxl_unclip = DiffusionEngine(network_config=network_config,
+                       denoiser_config=denoiser_config,
+                       first_stage_config=first_stage_config,
+                       conditioner_config=conditioner_config,
+                       sampler_config=sampler_config,
+                       scale_factor=scale_factor,
+                       disable_first_stage_autocast=disable_first_stage_autocast)
+    ckpt = torch.load(sdxl_unclip_path, map_location=args.device)
+    sdxl_unclip.load_state_dict(ckpt['state_dict'])
+    sdxl_unclip.eval().requires_grad_(False)
+
+    models = {
+        "clip": clip_img_embedder,
+        "mindeye2": mindeye2,
+        "vae": vae, 
+        "noise_scheduler": noise_scheduler, 
+        "cnx": cnx,
+        "l1": l1,
+        "clip_linear": clip_linear,
+        "clip_text_model": clip_text_model,
+        "token_to_text": token_to_text,
+        "base_text_embedder1": base_text_embedder1,
+        "base_text_embedder2": base_text_embedder2,
+        "sdxl": sdxl,
+        "sdxl_unclip": sdxl_unclip
+    }
+
+    return models
+
+
+

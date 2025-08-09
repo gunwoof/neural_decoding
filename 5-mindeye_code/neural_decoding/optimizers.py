@@ -45,3 +45,17 @@ def get_optimizer_lowlevel(args, model):
 
     if args.optimizer.lower() == 'adamw':
         return adamw(opt_grouped_parameters, lr=1e-3)
+    
+def get_optimizer_mindeye2(args, model):
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    
+    opt_grouped_parameters = [
+        {'params': [p for n, p in model.ridge.named_parameters()], 'weight_decay': 1e-2},
+        {'params': [p for n, p in model.backbone.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+        {'params': [p for n, p in model.backbone.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0},
+        {'params': [p for n, p in model.diffusion_prior.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 1e-2},
+        {'params': [p for n, p in model.diffusion_prior.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+    ]
+        
+    if args.optimizer.lower() == 'adamw':
+        return adamw(opt_grouped_parameters, lr=args.max_lr)

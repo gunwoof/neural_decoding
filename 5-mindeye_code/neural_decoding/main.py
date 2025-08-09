@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import save_image
 import wandb
 
+# mindeye1 & connectomind
 from args import parse_args
 from data import get_dataloader, sub1_train_dataset, sub1_train_dataset_hug, sub1_train_dataset_FuncSpatial
 from mindeye1 import get_model_highlevel, get_model_lowlevel, get_model_highlevel_FuncSpatial
@@ -19,6 +20,13 @@ from metrics import get_metric
 from trainer import train, inference, evaluate, retrieval_evaluate
 from all_trainer import high_train_inference_evaluate, low_train_inference_evaluate
 from utils import seed_everything, get_unique_path, save_gt_vs_recon_images
+
+# mindeye2
+from args_mindeye2 import parse_args
+from data import get_dataloader_hug2, train_dataset_hug2
+from mindeye2 import get_model
+from optimizers import get_optimizer_mindeye2
+from all_trainer_mindeye2 import pre_train
 
 def main():
     # parse_args 정의
@@ -413,10 +421,73 @@ def retrieval():
         f.write(f"Forward Retrieval Accuracy: {percent_fwd:.4f}\n")
         f.write(f"Backward Retrieval Accuracy: {percent_bwd:.4f}\n")
 
+def main_mindeye2_pretrain():
+
+    args = parse_args()
+
+    # data loader
+    subj_names = ['subj02', 'subj05', 'subj07']
+    seed_everything(args.seed) # 시드 고정
+    train_data = get_dataloader_hug2(args)
+    # setattr(args, 'mode', 'inference')
+    # test_data = get_dataloader_hug2(args)
+
+    # model 정의
+    models = get_model(args) 
+    # model_bundle = {
+    #     "clip": models["clip"].to(args.device),
+    #     "ridge": models["ridge"].to(args.device),
+    #     "backbone": models["backbone"].to(args.device),
+    #     "diffusion_prior": models["diffusion_prior"].to(args.device),
+    #     "vae": models["vae"].to(args.device), 
+    #     "noise_scheduler": models["noise_scheduler"], 
+    #     "cnx": models["cnx"], 
+    #     "clip_linear": models["clip_linear"], # inference에서만 사용
+    #     "clip_text_model": models["clip_text_model"], # inference에서만 사용
+    #     "token_to_text": models["token_to_text"], # inference에서만 사용
+    #     "base_text_embedder1": models["base_text_embedder1"], # inference에서만 사용
+    #     "base_text_embedder2": models["base_text_embedder2"], # inference에서만 사용
+    #     "sdxl": models["sdxl"], # inference에서만 사용
+    #     "sdxl_unclip": models["sdxl_unclip"] # inference에서만 사용
+    # }
+    model_bundle = {
+        "clip": models["clip"].to(args.device),
+        "mindeye2": models["mindeye2"].to(args.device),
+        "vae": models["vae"].to(args.device), 
+        "noise_scheduler": models["noise_scheduler"], 
+        "cnx": models["cnx"], 
+        "l1":  models["l1"]
+    }
+
+    # optimizer 정의
+    optimizer = get_optimizer_mindeye2(args, model_bundle["mindeye2"])
+
+    # scheduler 정의(train만 함)
+    train_dataset = train_dataset_hug2(args)
+    num_train = sum(len(dataset) for dataset in train_dataset.values()) # subject별 dict
+    lr_scheduler = get_scheduler(args, optimizer, num_train)
+
+    # wandb 적용
+    wandb.login() # login
+    wandb.init(project="mindeye2_pretrain", name=f"run-{wandb.util.generate_id()}") # init
+    wandb.config = vars(args) # aparse_args()의 내용 그대로 config로 주기
+
+    # train 시작
+    output_model = pre_train(args, subj_names, train_data, model_bundle, optimizer, lr_scheduler)
+
+    # model 저장
+    output_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, args.model_name + ".pt")
+    output_path = get_unique_path(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)  # 경로 없으면 생성
+    torch.save(output_model.state_dict(), output_path)
+
+
+   
 
 if __name__ == "__main__":
-    main()
+    # main()
     # main_high_all()
     # main_low_all()
     # main_high_all_FuncSpatial()
     # retrieval()
+    main_mindeye2_pretrain()

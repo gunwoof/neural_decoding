@@ -23,7 +23,7 @@ def cycle_scheduler(optimizer, total_steps, max_lr, num_epochs):
 def get_scheduler(args, optimizer, num_train):
     """학습률 스케줄러 선택자"""
     # 한 번에 돌릴 수 있는 데이터 개수: batch개수 * gpu개수
-    global_batch_size = args.batch_size * 1
+    global_batch_size = args.batch_size * args.num_subjects
     # global_batch_size = args.batch_size * world_size
     # epoch개수 * (전체 데이터 개수 // 한 번에 돌릴 수 있는 데이터 개수)
     total_steps = int(args.num_epochs * math.ceil(num_train / global_batch_size)) # 작은 데이터라도 남아 있으면 1개의 batch로 처리하도록 step 수를 올려줌

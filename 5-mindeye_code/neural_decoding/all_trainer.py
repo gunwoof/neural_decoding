@@ -366,7 +366,7 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
                 mean = torch.tensor([0.485, 0.456, 0.406]).to(device).reshape(1,3,1,1) # imagenet의 mean
                 std = torch.tensor([0.228, 0.224, 0.225]).to(device).reshape(1,3,1,1) # imagenet의 std
                 image_norm = (image - mean)/std
-                image_aug = (img_augment_low(image) - mean)/std
+                image_aug = (img_augment_low(image, 1) - mean)/std
                 _, cnx_embeds = cnx(image_norm)
                 _, cnx_aug_embeds = cnx(image_aug)
                 cont_loss = soft_cont_loss(

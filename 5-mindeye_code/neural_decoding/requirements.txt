@@ -18,3 +18,5 @@ pip install scikit-image==0.21.0
 
 pip uninstall huggingface_hub -y
 pip install huggingface_hub==0.21.4
+
+pip install omegaconf==2.3.0

@@ -498,11 +498,16 @@ def test_dataset_hug2(args, subj_names):
     return datasets  # {'subj01': Dataset, 'subj02': Dataset, ...}
 
 def get_dataloader_hug2(args):
+    '''
+        {'subj01': Dataset, 'subj02': Dataset, ...}
+    '''
     train_loaders={}
     inference_loaders={}
+    # subj_names = ['subj01', 'subj02', 'subj05', 'subj07']
+    subj_names = ['subj02', 'subj05', 'subj07']
 
     if args.mode == 'train':
-        train_datasets = train_dataset_hug2(args)
+        train_datasets = train_dataset_hug2(args, subj_names)
 
         for subj in train_datasets.keys():
             train_loader = DataLoader(train_datasets[subj], batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
@@ -511,10 +516,10 @@ def get_dataloader_hug2(args):
         return train_loaders
     
     if args.mode == 'inference':
-        inference_datasets = test_dataset_hug2(args)
+        inference_datasets = test_dataset_hug2(args, subj_names)
 
         for subj in inference_datasets.keys():
-            inference_loaders = DataLoader(inference_datasets[subj], batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
+            inference_loaders = DataLoader(inference_datasets[subj], batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle)
             inference_loaders[subj] = inference_loaders
 
         return inference_loaders
@@ -538,8 +543,6 @@ def get_dataloader(args):
         # test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_test(keep_idx))
         test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle)
         return test_loader
-    
-
     
     
 def worker_init_fn(worker_id):

@@ -29,33 +29,47 @@ def seed_everything(seed=0, cudnn_deterministic=True):
         print('Note: not using cudnn.deterministic')
 
 # image augmentation
-def img_augment_high(image: torch.Tensor):
-    img_augment_pipeline = AugmentationSequential(
-        kornia.augmentation.RandomResizedCrop((224,224), (0.6,1), p=0.3),
-        kornia.augmentation.Resize((224, 224)),
-        kornia.augmentation.RandomHorizontalFlip(p=0.5),
-        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
-        kornia.augmentation.RandomGrayscale(p=0.3),
-        data_keys=["input"],
-    )
-
+def img_augment_high(image: torch.Tensor, version=2):
+    if version == 1:
+        img_augment_pipeline = AugmentationSequential(
+            kornia.augmentation.RandomResizedCrop((224,224), (0.6,1), p=0.3),
+            kornia.augmentation.Resize((224, 224)),
+            kornia.augmentation.RandomHorizontalFlip(p=0.5),
+            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.3),
+            kornia.augmentation.RandomGrayscale(p=0.3),
+            data_keys=["input"],
+        )
+    if version == 2:
+        img_augment_pipeline = AugmentationSequential(
+            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.3),
+            same_on_batch=False,
+            data_keys=["input"],
+        )
     augmented = img_augment_pipeline(image)
 
     return augmented
 
 # image augmentation
-def img_augment_low(image: torch.Tensor):
-    img_augment_pipeline = AugmentationSequential(
-        # kornia.augmentation.RandomCrop((480, 480), p=0.3),
-        # kornia.augmentation.Resize((512, 512)),
-        kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
-        kornia.augmentation.RandomGrayscale(p=0.2),
-        kornia.augmentation.RandomSolarize(p=0.2),
-        kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0), p=0.1),
-        kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.5, 1.0)),
-        data_keys=["input"],
-    )
-
+def img_augment_low(image: torch.Tensor, version=2):
+    if version == 1:
+        img_augment_pipeline = AugmentationSequential(
+            # kornia.augmentation.RandomCrop((480, 480), p=0.3),
+            # kornia.augmentation.Resize((512, 512)),
+            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+            kornia.augmentation.RandomGrayscale(p=0.2),
+            kornia.augmentation.RandomSolarize(p=0.2),
+            kornia.augmentation.RandomGaussianBlur(kernel_size=(7, 7), sigma=(0.1, 2.0), p=0.1),
+            kornia.augmentation.RandomResizedCrop((512, 512), scale=(0.5, 1.0)),
+            data_keys=["input"],
+        )
+    if version == 2:
+        img_augment_pipeline = AugmentationSequential(
+            kornia.augmentation.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8),
+            kornia.augmentation.RandomGrayscale(p=0.1),
+            kornia.augmentation.RandomSolarize(p=0.1),
+            kornia.augmentation.RandomResizedCrop((224,224), scale=(.9,.9), ratio=(1,1), p=1.0),
+            data_keys=["input"],
+        )
     augmented = img_augment_pipeline(image)
 
     return augmented
@@ -141,7 +155,16 @@ def get_unique_path(base_path):
     return f"{base}_{i}{ext}"
 
 # 학습할때 nan체크 + 넘김
-def check_nan_and_log(global_step, fmri_vol=None, clip_voxels=None, loss=None, wandb=None):
+def check_nan_and_log(
+    global_step,
+    fmri_vol=None,
+    clip_voxels=None,
+    voxel_backbone=None,
+    voxel_retrieval=None,
+    voxel_lowlevels=None,
+    loss=None,
+    wandb=None
+):
     nan_flag = False
 
     if fmri_vol is not None and torch.isnan(fmri_vol).any():
@@ -154,6 +177,21 @@ def check_nan_and_log(global_step, fmri_vol=None, clip_voxels=None, loss=None, w
         if wandb: wandb.log({"debug/nan_clip_voxels": global_step})
         nan_flag = True
 
+    if voxel_backbone is not None and torch.isnan(voxel_backbone).any():
+        print(f"[NaN] Detected in `voxel_backbone` at step {global_step}")
+        if wandb: wandb.log({"debug/nan_voxel_backbone": global_step})
+        nan_flag = True
+
+    if voxel_retrieval is not None and torch.isnan(voxel_retrieval).any():
+        print(f"[NaN] Detected in `voxel_retrieval` at step {global_step}")
+        if wandb: wandb.log({"debug/nan_voxel_retrieval": global_step})
+        nan_flag = True
+
+    if voxel_lowlevels is not None and torch.isnan(voxel_lowlevels).any():
+        print(f"[NaN] Detected in `voxel_lowlevels` at step {global_step}")
+        if wandb: wandb.log({"debug/nan_voxel_lowlevels": global_step})
+        nan_flag = True
+
     if loss is not None and torch.isnan(loss):
         print(f"[NaN] Detected in `loss` at step {global_step}")
         if wandb: wandb.log({"debug/nan_loss": global_step})
@@ -163,6 +201,7 @@ def check_nan_and_log(global_step, fmri_vol=None, clip_voxels=None, loss=None, w
         print(f"[Warning] Skipping batch due to NaN at step {global_step}")
 
     return nan_flag
+
 
 def log_gradient_norms(model, global_step=None, verbose=True):
     """
