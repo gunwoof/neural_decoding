@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -17,6 +18,7 @@ from dalle2_pytorch import DiffusionPrior
 from dalle2_pytorch.dalle2_pytorch import l2norm, default, exists, RotaryEmbedding, CausalTransformer, SinusoidalPosEmb, MLP, Rearrange, repeat, rearrange, prob_mask_like, LayerNorm, RelPosBias, Attention, FeedForward
 
 # for caption
+sys.path.append('generative_models/')
 from pretrained_cache.BrainCaptioning.modeling_git import GitForCausalLMClipEmb # caption token 생성
 from transformers import AutoProcessor # (caption token -> english) 변환
 from pretrained_cache.generative_models.sgm.modules.encoders.modules import FrozenCLIPEmbedder, FrozenOpenCLIPEmbedder2 # SDXL이 text condition을 2개의 embedding으로 받음
@@ -62,8 +64,8 @@ class BrainNetwork(nn.Module):
         self.clip_proj = self.projector(clip_size, clip_size, h=clip_size)
         
         # low-level submodule
-        # self.blin1 = nn.Linear(h*seq_len,4*28*28,bias=True) # [4, 64, 64]을 만들기 위해 버림
-        self.blin1 = nn.Linear(h*seq_len,64*8*8,bias=True)
+        self.blin1 = nn.Linear(h*seq_len,4*28*28,bias=True) # [4, 64, 64]을 만들기 위해 버림
+        # self.blin1 = nn.Linear(h*seq_len,64*8*8,bias=True)
         self.bdropout = nn.Dropout(.3)
         self.bnorm = nn.GroupNorm(1, 64)
         self.bupsampler = Decoder(
@@ -127,19 +129,20 @@ class BrainNetwork(nn.Module):
 
         # low-level submodule
         lowlevels = (None, None)
-        if self.blurry_recon:
-            lowlevel = self.blin1(x) # [B, 64*8*8]
-            lowlevel = self.bdropout(lowlevel)
-            lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 8, 8).contiguous() # [B, 64, 8, 8]
-            lowlevel = self.bnorm(lowlevel) 
 
-            # l1 loss에 사용됨 -> 실제 blurry image prediction 값
-            lowlevel_l1 = self.bupsampler(lowlevel)
+        lowlevel = self.blin1(x) # [B, 64*8*8]
+        lowlevel = self.bdropout(lowlevel)
+        # lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 8, 8).contiguous() # [B, 64, 8, 8]
+        lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 7, 7).contiguous() # [B, 64, ７, ７]
+        lowlevel = self.bnorm(lowlevel) 
 
-            # ConvNext loss에 사용됨
-            lowlevel_aux = self.b_maps_projector(lowlevel).flatten(2).permute(0,2,1) # [B, 64, 512]
+        # l1 loss에 사용됨 -> 실제 blurry image prediction 값
+        lowlevel_l1 = self.bupsampler(lowlevel)
 
-            lowlevels = (lowlevel_l1, lowlevel_aux) # ([B, 4, 64, 64], [B, 64, 512])
+        # ConvNext loss에 사용됨
+        lowlevel_aux = self.b_maps_projector(lowlevel).flatten(2).permute(0,2,1) # [B, 64, 512]
+
+        lowlevels = (lowlevel_l1, lowlevel_aux) # ([B, 4, 64, 64], [B, 64, 512])
         
         # backbone(Diffusion prior), retrieval(retrieval submodule), lowlevel(low-level submodule)
         return backbone, retrieval, lowlevels
@@ -199,19 +202,6 @@ class BrainDiffusionPrior(DiffusionPrior):
 
         return image_embed
     
-    @torch.no_grad()
-    def p_sample(self, x, t, text_cond = None, self_cond = None, clip_denoised = True, cond_scale = 1.):
-        b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = t, text_cond = text_cond, self_cond = self_cond, clip_denoised = clip_denoised, cond_scale = cond_scale)
-
-        noise = torch.randn_like(x)
-
-        # t-1에 denoise 
-        # 생성
-        nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
-        # 적용
-        pred = model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
-        return pred, x_start
 
 # dalle2의 diffusionprior에서 x0(보통은 입실론)을 뽑음 only 1 step
 class PriorNetwork(nn.Module):
@@ -357,6 +347,91 @@ class MindEyeModule(nn.Module):
     def forward(self, x):
         return x
     
+def get_pretrain_model(args):
+
+    #### image clip 정의 ####
+    clip_img_embedder = FrozenOpenCLIPImageEmbedder(
+        arch="ViT-bigG-14",
+        version="laion2b_s39b_b160k",
+        output_tokens=True,
+    )
+
+    #### 학습하는 모델을 담을 객체 ####
+    mindeye2 = MindEyeModule()
+        
+    #### ridge(Shared-subject latent space) 정의 ####
+    num_voxels_list = [14278, 13039, 12682] # subject 2,5,7
+    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096)
+
+    #### Residual MLP backbone 정의 ####
+    mindeye2.backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664)
+
+    #### difussion prior 정의 ####
+    clip_seq_dim = 256
+    out_dim = 1664 # 모델 거치면 256 * 1664 나옴
+    depth = 6 # transformer의 layer 수 -> difussion prior의 한 step의 layer
+    dim_head = 52 # head당 dim
+    heads = out_dim//dim_head # attention head 수
+    timesteps = 100 # difusion step 수 
+
+    prior_network = PriorNetwork(
+            dim=out_dim,
+            depth=depth,
+            dim_head=dim_head,
+            heads=heads,
+            causal=False,
+            num_tokens = clip_seq_dim,
+            learned_query_mode="pos_emb"
+    )
+
+    mindeye2.diffusion_prior = BrainDiffusionPrior(
+        net=prior_network,
+        image_embed_dim=out_dim,
+        condition_on_text_encodings=False,
+        timesteps=timesteps,
+        cond_drop_prob=0.2,
+        image_embed_scale=None,
+    )
+
+    #### low-level 정의 ####
+    #### encoder & decoder 정의 ####
+    try:
+        # 전체 pipeline 로컬에서 로드
+        sd_model_dir = os.path.join(args.cache_dir, "models--lambdalabs--sd-image-variations-diffusers", "snapshots")
+        snapshot_name = os.listdir(sd_model_dir)  # 첫 snapshot
+        snapshot_path = os.path.join(sd_model_dir, snapshot_name[0])
+
+        sd_pipe = DiffusionPipeline.from_pretrained(snapshot_path)
+    except Exception as e:
+        print(f"[!] 로컬 snapshot 로딩 실패, 온라인에서 전체 모델 로드: {e}")
+        sd_pipe = DiffusionPipeline.from_pretrained("lambdalabs/sd-image-variations-diffusers", cache_dir=args.cache_dir)
+
+    # 학습 비활성화
+    sd_pipe.vae.eval().requires_grad_(False)
+    
+    vae = sd_pipe.vae
+    noise_scheduler = sd_pipe.scheduler
+
+    # convnext + mlp 정의(loss에서만 사용)
+    cnx_path = os.path.join(args.cache_dir, "convnext_xlarge_alpha0.75_fullckpt.pth")
+    cnx = ConvnextXL(cnx_path)
+    cnx.requires_grad_(False)
+    cnx.eval()
+
+    # L1 loss
+    l1 = nn.L1Loss()
+
+    models = {
+        "clip": clip_img_embedder,
+        "mindeye2": mindeye2,
+        "vae": vae, 
+        "noise_scheduler": noise_scheduler, 
+        "cnx": cnx,
+        "l1": l1
+    }
+
+    return models
+
 def get_model(args):
 
     #### image clip 정의 ####
@@ -364,15 +439,14 @@ def get_model(args):
         arch="ViT-bigG-14",
         version="laion2b_s39b_b160k",
         output_tokens=True,
-        only_tokens=True,
     )
 
     #### 학습하는 모델을 담을 객체 ####
     mindeye2 = MindEyeModule()
         
     #### ridge(Shared-subject latent space) 정의 ####
-    num_voxels_list = [15724, 14278, 13039, 12682] # subject 1,2,5,7
-    mindeye2.ridge = RidgeRegression(num_voxels_list=num_voxels_list, out_features=4096).to(args.device)
+    num_voxels_list = [14278, 13039, 12682] # subject 2,5,7
+    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096).to(args.device)
 
     #### Residual MLP backbone 정의 ####
     mindeye2.backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664).to(args.device)
@@ -438,62 +512,75 @@ def get_model(args):
     token_to_text = AutoProcessor.from_pretrained("microsoft/git-large-coco") # (caption token -> english) 변환
 
     #### reconstruction 정의 ####
-    # config 정의
-    config = OmegaConf.load("pretrained_cache/generative_models/configs/inference/sd_xl_base.yaml") # yaml불러오기
-    config = OmegaConf.to_container(config, resolve=True) # yaml dic으로 변환
-    refiner_params = config["model"]["params"]
-    network_config = refiner_params["network_config"]
-    denoiser_config = refiner_params["denoiser_config"]
-    first_stage_config = refiner_params["first_stage_config"]
-    conditioner_config = refiner_params["conditioner_config"]
-    scale_factor = refiner_params["scale_factor"]
-    disable_first_stage_autocast = refiner_params["disable_first_stage_autocast"]
+    # unclip config 정의
+    unclip_cfg = OmegaConf.load("pretrained_cache/generative_models/configs/unclip6.yaml")
+    unclip_cfg = OmegaConf.to_container(unclip_cfg, resolve=True)
+    unclip_params = unclip_cfg["model"]["params"]
 
-    config = OmegaConf.load("generative_models/configs/unclip6.yaml") # yaml불러오기
-    config = OmegaConf.to_container(config, resolve=True) # yaml dic으로 변환
-    unclip_params = config["model"]["params"]
-    sampler_config = unclip_params["sampler_config"]
-    sampler_config['params']['num_steps'] = 38
+    unclip_network_config     = unclip_params["network_config"]
+    unclip_denoiser_config    = unclip_params["denoiser_config"]
+    unclip_first_stage_config = unclip_params["first_stage_config"]
+    unclip_conditioner_config = unclip_params["conditioner_config"]
+    unclip_sampler_config     = unclip_params["sampler_config"].copy()  # copy로 사이드이펙트 방지
+    unclip_scale_factor       = unclip_params["scale_factor"]
+    unclip_disable_first_stage_autocast = unclip_params["disable_first_stage_autocast"]
 
-    # caption을 text embedding으로 변환
+    # sdxl unclip 정의
+    unclip_first_stage_config['target'] = 'sgm.models.autoencoder.AutoencoderKL'
+    unclip_sampler_config['params']['num_steps'] = 38
+    sdxl_unclip_path = os.path.join(args.cache_dir, "generative_models", "unclip6_epoch0_step110000.ckpt")
+    sdxl_unclip = DiffusionEngine(network_config=unclip_network_config,
+                       denoiser_config=unclip_denoiser_config,
+                       first_stage_config=unclip_first_stage_config,
+                       conditioner_config=unclip_conditioner_config,
+                       sampler_config=unclip_sampler_config,
+                       scale_factor=unclip_scale_factor,
+                       disable_first_stage_autocast=unclip_disable_first_stage_autocast)
+    ckpt = torch.load(sdxl_unclip_path, map_location=args.device)
+    sdxl_unclip.load_state_dict(ckpt['state_dict'])
+    sdxl_unclip.eval().requires_grad_(False)
+
+
+    # base config 정의
+    base_cfg = OmegaConf.load("pretrained_cache/generative_models/configs/inference/sd_xl_base.yaml")
+    base_cfg = OmegaConf.to_container(base_cfg, resolve=True)
+    base_params = base_cfg["model"]["params"]
+
+    base_network_config     = base_params["network_config"]
+    base_denoiser_config    = base_params["denoiser_config"]
+    base_first_stage_config = base_params["first_stage_config"]
+    base_conditioner_config = base_params["conditioner_config"]
+    base_scale_factor       = base_params["scale_factor"]
+    base_disable_first_stage_autocast = base_params["disable_first_stage_autocast"]
+
+    # caption 임베더 (base conditioner 기준)
     base_text_embedder1 = FrozenCLIPEmbedder(
-    layer=conditioner_config['params']['emb_models'][0]['params']['layer'],
-    layer_idx=conditioner_config['params']['emb_models'][0]['params']['layer_idx'],
+        layer=base_conditioner_config['params']['emb_models'][0]['params']['layer'],
+        layer_idx=base_conditioner_config['params']['emb_models'][0]['params']['layer_idx'],
     )
     base_text_embedder2 = FrozenOpenCLIPEmbedder2(
-        arch=conditioner_config['params']['emb_models'][1]['params']['arch'],
-        version=conditioner_config['params']['emb_models'][1]['params']['version'],
-        freeze=conditioner_config['params']['emb_models'][1]['params']['freeze'],
-        layer=conditioner_config['params']['emb_models'][1]['params']['layer'],
-        always_return_pooled=conditioner_config['params']['emb_models'][1]['params']['always_return_pooled'],
-        legacy=conditioner_config['params']['emb_models'][1]['params']['legacy'],
+        arch=base_conditioner_config['params']['emb_models'][1]['params']['arch'],
+        version=base_conditioner_config['params']['emb_models'][1]['params']['version'],
+        freeze=base_conditioner_config['params']['emb_models'][1]['params']['freeze'],
+        layer=base_conditioner_config['params']['emb_models'][1]['params']['layer'],
+        always_return_pooled=base_conditioner_config['params']['emb_models'][1]['params']['always_return_pooled'],
+        legacy=base_conditioner_config['params']['emb_models'][1]['params']['legacy'],
     )
 
     # sdxl 정의
     sdxl_path = os.path.join(args.cache_dir, "generative_models", "zavychromaxl_v30.safetensors")
-    sdxl = DiffusionEngine(network_config=network_config,
-                       denoiser_config=denoiser_config,
-                       first_stage_config=first_stage_config,
-                       conditioner_config=conditioner_config,
-                       sampler_config=sampler_config, # using the one defined by the unclip
-                       scale_factor=scale_factor,
-                       disable_first_stage_autocast=disable_first_stage_autocast,
-                       ckpt_path=sdxl_path)
-    sdxl.eval().requires_grad_(False)
+    sdxl = DiffusionEngine(
+        network_config=base_network_config,
+        denoiser_config=base_denoiser_config,
+        first_stage_config=base_first_stage_config,
+        conditioner_config=base_conditioner_config,
+        sampler_config=unclip_sampler_config,          
+        scale_factor=base_scale_factor,
+        disable_first_stage_autocast=base_disable_first_stage_autocast,
+        ckpt_path=sdxl_path
+    ).eval().requires_grad_(False)
 
-    # sdxl unclip 정의
-    first_stage_config['target'] = 'sgm.models.autoencoder.AutoencoderKL'
-    sdxl_unclip_path = os.path.join(args.cache_dir, "generative_models", "unclip6_epoch0_step110000.ckpt")
-    sdxl_unclip = DiffusionEngine(network_config=network_config,
-                       denoiser_config=denoiser_config,
-                       first_stage_config=first_stage_config,
-                       conditioner_config=conditioner_config,
-                       sampler_config=sampler_config,
-                       scale_factor=scale_factor,
-                       disable_first_stage_autocast=disable_first_stage_autocast)
-    ckpt = torch.load(sdxl_unclip_path, map_location=args.device)
-    sdxl_unclip.load_state_dict(ckpt['state_dict'])
-    sdxl_unclip.eval().requires_grad_(False)
+
 
     models = {
         "clip": clip_img_embedder,

@@ -14,9 +14,16 @@ pip install git+https://github.com/lucidrains/dalle2-pytorch.git
 pip install scikit-image==0.21.0
 
 # pip install diffusers==0.14.0
-# pip install diffusers==0.25.0
+# pip install diffusers==0.23.0
 
 pip uninstall huggingface_hub -y
 pip install huggingface_hub==0.21.4
 
 pip install omegaconf==2.3.0
+pip install pytorch-lightning==2.0.1
+pip install xformers==0.0.22.post7
+pip uninstall -y numpy numba
+pip install numpy==1.24.4
+pip install numba==0.58.1
+
+pip install deepspeed==0.12.6

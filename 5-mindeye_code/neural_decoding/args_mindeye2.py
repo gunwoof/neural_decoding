@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-def parse_args():
+def parse_args2():
     parser = argparse.ArgumentParser(description="Model Training Configuration")
 
     ###### Frequently changing settings ######
@@ -14,25 +14,21 @@ def parse_args():
         help='device',
     )
     parser.add_argument(
-        "--num_epochs",type=int,default=250, choices=[3,240],
+        "--num_epochs",type=int,default=150, choices=[1, 3, 150],
         help="epoch 개수",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=160,
+        "--batch_size", type=int, default=10,
         help="Batch size(H100:160, L40:90), if benchmark L40:30",
     )
-
-
-    ###### scheduler ######
     parser.add_argument(
-        "--max_lr",type=float,default=3e-4,
+        "--prefetch_factor", type=int, default=10, choices=[2,4,5,6,8,10],
+        help="한 프로세스에서 몇 개 처리할지(H100:10, L40:5)",
     )
     parser.add_argument(
-        "--scheduler_type",type=str,default='cycle',
-        choices=['cycle','linear'],
+        "--num_workers", type=int, default=20, choices=[4,8,10,12,16,20,30],
+        help="multi-processing in dataloader-메모리와 cpu개수에 맞게 조정(H100:30, L40:10)",
     )
-    ####################
-
 
     ###### data.py ######
     parser.add_argument(
@@ -40,11 +36,11 @@ def parse_args():
         help="Path to the BIDS root."
     )
     parser.add_argument(
-        "--fmri_dir", type=str, default="3-bids/derivatives",
+        "--fmri_dir", type=str, default="3-bids/2-derivatives/1-beta",
         help="Path to the BIDS fmri."
     )
     parser.add_argument(
-        "--fmri_detail_dir", type=str, default="beta_hf_dk",
+        "--fmri_detail_dir", type=str, default="beta_huggingface",
         choices=["b4_roi_zscore","beta_huggingface","beta_hf_dk"],
         help="Path to the BIDS fmri_detail."
     )
@@ -59,6 +55,13 @@ def parse_args():
         "--is_shuffle",action=argparse.BooleanOptionalAction,default=False,
         help="is shuffle",
     )
+
+    ###### mindeye2 ######
+    parser.add_argument(
+        "--cache_dir", type=str, default='/nas/research/03-Neural_decoding/5-mindeye_code/pretrained_cache',
+        help="Where is cached Diffusion model; if not cached will download to this path",
+    )
+    ####################
 
     ###### optimizer ######
     parser.add_argument(
@@ -106,7 +109,7 @@ def parse_args():
         help="Path to the output."
     )
     parser.add_argument(
-        "--model_name", type=str, default="mindeye2_pretrin",
+        "--model_name", type=str, default="mindeye2_finetunning",
         help="모델 이름"
     )
     parser.add_argument(

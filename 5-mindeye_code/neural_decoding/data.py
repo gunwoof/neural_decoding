@@ -293,6 +293,25 @@ class hug2_TestDataset(Dataset): # ses단위로 실행
 
         return fmri_vol, image, self.cocoid[idx]
 
+# DataLoader를 한 번만 사용하기 위해 Dataset을 묶어줌
+class MultiSubjectDatasetStrict(Dataset):
+    '''
+        {'subj01': Dataset[idx], 'subj02': Dataset[idx], ...}
+    '''
+    def __init__(self, datasets: dict):
+        self.datasets = datasets
+        self.subjs = list(datasets.keys())
+        lengths = [len(datasets[subj]) for subj in self.subjs]
+        assert len(set(lengths)) == 1, f"모든 subject 길이가 같아야 합니다: {lengths}"
+        self._len = lengths[0]
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        # {subj: (fmri, image)} 반환
+        return {subj: self.datasets[subj][idx] for subj in self.subjs}
+
 def sub1_train_dataset(args): # ses단위로 실행
 
     root_dir = args.root_dir
@@ -457,7 +476,7 @@ def sub1_test_dataset_FuncSpatial(args):
 
 def train_dataset_hug2(args, subj_names):
     """
-    subj_names: ['subj01', 'subj02', ...] 
+    subj_names: ['sub-01', 'sub-02', ...] 
     """
     root_dir = args.root_dir
     fmri_dir = args.fmri_dir
@@ -478,7 +497,7 @@ def train_dataset_hug2(args, subj_names):
 
 def test_dataset_hug2(args, subj_names):
     """
-    subj_names: ['subj01', 'subj02', ...] 
+    subj_names: ['sub-01', 'sub-02', ...] 
     """
     root_dir = args.root_dir
     fmri_dir = args.fmri_dir
@@ -497,33 +516,47 @@ def test_dataset_hug2(args, subj_names):
 
     return datasets  # {'subj01': Dataset, 'subj02': Dataset, ...}
 
-def get_dataloader_hug2(args):
+def get_dataloader_hug2(args, subj_names):
     '''
-        {'subj01': Dataset, 'subj02': Dataset, ...}
+    batch = {
+        "sub-01": (
+            torch.stack([fmri_01_idx0, fmri_01_idx1]),   # shape: [각 batch size, volumne개수]
+            torch.stack([img_01_idx0, img_01_idx1])      # shape: [각 batch size, 3, 224, 224]
+        ),
+        "sub-02": (
+            torch.stack([fmri_02_idx0, fmri_02_idx1]),   # shape: [각 batch size, volumne개수]
+            torch.stack([img_02_idx0, img_02_idx1])      # shape: [각 batch size, 3, 224, 224]
+        ),
+        "sub-03": (
+            torch.stack([fmri_03_idx0, fmri_03_idx1]),   # shape: [각 batch size, volumne개수]
+            torch.stack([img_03_idx0, img_03_idx1])      # shape: [각 batch size, 3, 224, 224]
+        ),
+    }
+        
     '''
     train_loaders={}
     inference_loaders={}
-    # subj_names = ['subj01', 'subj02', 'subj05', 'subj07']
-    subj_names = ['subj02', 'subj05', 'subj07']
 
     if args.mode == 'train':
         train_datasets = train_dataset_hug2(args, subj_names)
+        multi_train_dataset = MultiSubjectDatasetStrict(train_datasets) # {subj: (fmri, image)} 반환
 
-        for subj in train_datasets.keys():
-            train_loader = DataLoader(train_datasets[subj], batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
-            train_loaders[subj] = train_loader
-
+        # 여기서 batch_size는 각각의 개수임. 합친 수 아님 ex) 각각 10 -> 전체 30
+        train_loaders = DataLoader(multi_train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
         return train_loaders
     
     if args.mode == 'inference':
         inference_datasets = test_dataset_hug2(args, subj_names)
 
-        for subj in inference_datasets.keys():
-            inference_loaders = DataLoader(inference_datasets[subj], batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle)
-            inference_loaders[subj] = inference_loaders
+        multi_inference_dataset = MultiSubjectDatasetStrict(inference_datasets) # {subj: (fmri, image)} 반환
 
+        # 여기서 batch_size는 각각의 개수임. 합첸 수 아님 ex) 각각 10 -> 전체 30 
+        # 다만 fine-tunning에서는 subject 하나만 사용하니까 batch size를 올려도 됨
+        inference_loaders = DataLoader(multi_inference_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
         return inference_loaders
 
+
+# mindeye1 & connectomind
 def get_dataloader(args):
 
     # 제거할 index 집합

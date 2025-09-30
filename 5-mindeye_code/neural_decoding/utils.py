@@ -14,6 +14,8 @@ from kornia.augmentation.container import AugmentationSequential
 # mixco
 import torch.nn.functional as F
 
+from pretrained_cache.generative_models.sgm.util import append_dims
+
 # seed
 def seed_everything(seed=0, cudnn_deterministic=True):
     random.seed(seed)
@@ -187,7 +189,8 @@ def check_nan_and_log(
         if wandb: wandb.log({"debug/nan_voxel_retrieval": global_step})
         nan_flag = True
 
-    if voxel_lowlevels is not None and torch.isnan(voxel_lowlevels).any():
+    # tuple이라 다르게 처리
+    if voxel_lowlevels is not None and any(torch.isnan(t).any() for t in voxel_lowlevels):
         print(f"[NaN] Detected in `voxel_lowlevels` at step {global_step}")
         if wandb: wandb.log({"debug/nan_voxel_lowlevels": global_step})
         nan_flag = True
@@ -498,3 +501,46 @@ def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, 
     
     loss = (loss1 + loss2)/2
     return loss
+
+
+def unclip_recon(x, diffusion_engine, vector_suffix,
+                 num_samples=1, offset_noise_level=0.04):
+    assert x.ndim==3
+    if x.shape[0]==1:
+        x = x[[0]]
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16), diffusion_engine.ema_scope():
+        z = torch.randn(num_samples,4,96,96).to(device) # starting noise, can change to VAE outputs of initial image for img2img
+
+        # clip_img_tokenized = clip_img_embedder(image) 
+        # tokens = clip_img_tokenized
+        token_shape = x.shape
+        tokens = x
+        c = {"crossattn": tokens.repeat(num_samples,1,1), "vector": vector_suffix.repeat(num_samples,1)}
+
+        tokens = torch.randn_like(x)
+        uc = {"crossattn": tokens.repeat(num_samples,1,1), "vector": vector_suffix.repeat(num_samples,1)}
+
+        for k in c:
+            c[k], uc[k] = map(lambda y: y[k][:num_samples].to(device), (c, uc))
+
+        noise = torch.randn_like(z)
+        sigmas = diffusion_engine.sampler.discretization(diffusion_engine.sampler.num_steps)
+        sigma = sigmas[0].to(z.device)
+
+        if offset_noise_level > 0.0:
+            noise = noise + offset_noise_level * append_dims(
+                torch.randn(z.shape[0], device=z.device), z.ndim
+            )
+        noised_z = z + noise * append_dims(sigma, z.ndim)
+        noised_z = noised_z / torch.sqrt(
+            1.0 + sigmas[0] ** 2.0
+        )  # Note: hardcoded to DDPM-like scaling. need to generalize later.
+
+        def denoiser(x, sigma, c):
+            return diffusion_engine.denoiser(diffusion_engine.model, x, sigma, c)
+
+        samples_z = diffusion_engine.sampler(denoiser, noised_z, cond=c, uc=uc)
+        samples_x = diffusion_engine.decode_first_stage(samples_z)
+        samples = torch.clamp((samples_x*.8+.2), min=0.0, max=1.0)
+        # samples = torch.clamp((samples_x + .5) / 2.0, min=0.0, max=1.0)
+        return samples

@@ -19,7 +19,7 @@ def parse_args():
         help='device',
     )
     parser.add_argument(
-        "--batch_size", type=int, default=160,
+        "--batch_size", type=int, default=300,
         help="Batch size(H100:160, L40:90), if benchmark L40:30",
     )
     parser.add_argument(
