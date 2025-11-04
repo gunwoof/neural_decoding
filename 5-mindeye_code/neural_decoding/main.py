@@ -33,7 +33,7 @@ from args_mindeye2 import parse_args2
 from data import get_dataloader_hug2, train_dataset_hug2
 from mindeye2 import get_pretrain_model, get_model
 from optimizers import get_optimizer_mindeye2
-from all_trainer_mindeye2 import pre_train, fine_tunning
+from all_trainer_mindeye2 import pre_train, fine_tunning_train, inference_evaluate, pre_train_continous
 
 def main():
     # parse_args 정의
@@ -389,7 +389,7 @@ def main_high_all_FuncSpatial():
 
     # wandb 적용
     wandb.login() # login
-    wandb.init(project="neural_decoding_highlevel", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
+    wandb.init(project="neural_decoding_highlevel_test", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
 
     high_train_inference_evaluate(args, train_data, test_data, model_bundle, optimizer, lr_scheduler, metric_bundle)
 
@@ -434,7 +434,7 @@ def main_mindeye2_pretrain():
     device = args.device
 
     # data loader
-    subj_names = ['sub-02', 'sub-05', 'sub-07']
+    subj_names = [ 'sub-01', 'sub-02', 'sub-05', 'sub-07']
     seed_everything(args.seed) # 시드 고정
     train_data = get_dataloader_hug2(args, subj_names)
 
@@ -462,25 +462,17 @@ def main_mindeye2_pretrain():
     wandb.init(project="mindeye2_pretrain", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
 
     # train 시작
-    output_model = pre_train(args, subj_names, train_data, model_bundle, optimizer, lr_scheduler)
+    pre_train(args, subj_names, train_data, model_bundle, optimizer, lr_scheduler)
 
-    # model 저장
-    output_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, args.model_name + ".pt")
-    output_path = get_unique_path(output_path)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)  # 경로 없으면 생성
-    torch.save(output_model.state_dict(), output_path)
-
-def main_mindeye2_finetunning():
+def main_mindeye2_pretrain_continous():
 
     args = parse_args2()
     device = args.device
 
     # data loader
-    subj_names = ['sub-01']
+    subj_names = [ 'sub-01', 'sub-02', 'sub-05', 'sub-07']
     seed_everything(args.seed) # 시드 고정
     train_data = get_dataloader_hug2(args, subj_names)
-    setattr(args, 'mode', 'inference')
-    test_data = get_dataloader_hug2(args, subj_names)
 
     # model 정의
     models = get_pretrain_model(args) 
@@ -489,15 +481,44 @@ def main_mindeye2_finetunning():
         "mindeye2": models["mindeye2"].to(device),
         "vae": models["vae"].to(device), 
         "cnx": models["cnx"].to(device), 
+        "l1":  models["l1"].to(device)
+    }
+
+
+    # optimizer 정의
+    optimizer = get_optimizer_mindeye2(args, model_bundle["mindeye2"])
+
+    # scheduler 정의(train만 함)
+    train_dataset = train_dataset_hug2(args, subj_names)
+    num_train = sum(len(dataset) for dataset in train_dataset.values()) # subject별 dict
+    lr_scheduler = get_scheduler(args, optimizer, num_train)
+
+    # wandb 적용
+    wandb.login() # login
+    wandb.init(project="mindeye2_pretrain_continous", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
+
+    # train 시작
+    pre_train_continous(args, subj_names, train_data, model_bundle, optimizer, lr_scheduler)
+
+
+def main_mindeye2_finetunning_train():
+
+    args = parse_args2()
+    device = args.device
+
+    # data loader
+    subj_names = ['sub-01']
+    seed_everything(args.seed) # 시드 고정
+    train_data = get_dataloader_hug2(args, subj_names)
+
+    # model 정의
+    models = get_model(args) 
+    model_bundle = {
+        "clip": models["clip"].to(device),
+        "mindeye2": models["mindeye2"].to(device),
+        "vae": models["vae"].to(device), 
+        "cnx": models["cnx"].to(device), 
         "l1":  models["l1"].to(device),
-        "noise_scheduler": models["noise_scheduler"].to(device), 
-        "clip_linear": models["clip_linear"].to(device), # inference에서만 사용
-        "clip_text_model": models["clip_text_model"].to(device), # inference에서만 사용
-        "token_to_text": models["token_to_text"].to(device), # inference에서만 사용
-        "base_text_embedder1": models["base_text_embedder1"].to(device), # inference에서만 사용
-        "base_text_embedder2": models["base_text_embedder2"].to(device), # inference에서만 사용
-        "sdxl": models["sdxl"].to(device), # inference에서만 사용
-        "sdxl_unclip": models["sdxl_unclip"].to(device) # inference에서만 사용
     }
 
     # optimizer 정의
@@ -510,24 +531,95 @@ def main_mindeye2_finetunning():
 
     # wandb 적용
     wandb.login() # login
-    wandb.init(project="mindeye2_finetunning", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
+    wandb.init(project="mindeye2_finetunning_train", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
 
     # train 시작
-    output_model = fine_tunning(args, subj_names, train_data, test_data, model_bundle, optimizer, lr_scheduler)
+    fine_tunning_train(args, subj_names, train_data, model_bundle, optimizer, lr_scheduler)
 
-    # model 저장
-    output_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, args.model_name + ".pt")
-    output_path = get_unique_path(output_path)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)  # 경로 없으면 생성
-    torch.save(output_model.state_dict(), output_path)
+def main_mindeye2_inference_evaluate():
+
+    args = parse_args2()
+    device = args.device
+
+    # data loader
+    subj_names = ['sub-01']
+    seed_everything(args.seed) # 시드 고정
+    setattr(args, 'mode', 'inference')
+    test_data = get_dataloader_hug2(args, subj_names)
+
+    # model 정의
+    models = get_model(args) 
+    model_bundle = {
+        "mindeye2": models["mindeye2"].to(device),
+        "vae": models["vae"].to(device), 
+        "noise_scheduler": models["noise_scheduler"], 
+        "clip_linear": models["clip_linear"].to(device), # inference에서만 사용
+        "clip_text_model": models["clip_text_model"].to(device), # inference에서만 사용
+        "token_to_text": models["token_to_text"], # inference에서만 사용
+        "base_text_embedder1": models["base_text_embedder1"].to(device), # inference에서만 사용
+        "base_text_embedder2": models["base_text_embedder2"].to(device), # inference에서만 사용
+        "sdxl": models["sdxl"].to(device), # inference에서만 사용
+        "sdxl_unclip": models["sdxl_unclip"].to(device) # inference에서만 사용
+    }
+
+    # metric 정의
+    metrics = get_metric(args)
+    metric_bundle = {
+        "pixcorr": metrics["pixcorr"],
+        "ssim": metrics["ssim"],
+        "alexnet2": {
+            "model": metrics["alexnet2"]["model"].to(args.device),
+            "preprocess": metrics["alexnet2"]["preprocess"],
+            "layer": metrics["alexnet2"]["layer"],
+            "metric_fn": metrics["alexnet2"]["metric_fn"],
+        },
+        "alexnet5": {
+            "model": metrics["alexnet5"]["model"].to(args.device),
+            "preprocess": metrics["alexnet5"]["preprocess"],
+            "layer": metrics["alexnet5"]["layer"],
+            "metric_fn": metrics["alexnet5"]["metric_fn"],
+        },
+        "clip": {
+            "model": metrics["clip"]["model"].to(args.device),
+            "preprocess": metrics["clip"]["preprocess"],
+            "metric_fn": metrics["clip"]["metric_fn"],
+        },
+        "inception": {
+            "model": metrics["inception"]["model"].to(args.device),
+            "preprocess": metrics["inception"]["preprocess"],
+            "metric_fn": metrics["inception"]["metric_fn"],
+        },
+        "efficientnet": {
+            "model": metrics["efficientnet"]["model"].to(args.device),
+            "preprocess": metrics["efficientnet"]["preprocess"],
+            "metric_fn": metrics["efficientnet"]["metric_fn"],
+        },
+        "swav": {
+            "model": metrics["swav"]["model"].to(args.device),
+            "preprocess": metrics["swav"]["preprocess"],
+            "metric_fn": metrics["swav"]["metric_fn"],
+        },
+    }
+
+    # checkpoint path저장
+    ckpt_dir = os.path.join(args.root_dir, args.code_dir, args.output_dir, "mindeye2_metric")
+
+    # wandb 적용
+    wandb.login() # login
+    wandb.init(project="mindeye2_inference_evaluate", name=f"run-{wandb.util.generate_id()}", config=vars(args)) # init
+
+    # infernce + evaluate 시작
+    inference_evaluate(args, subj_names, test_data, model_bundle, metric_bundle, ckpt_dir)
+
 
 if __name__ == "__main__":
     # main()
-    # main_high_all()
+    # main_high_all
     # main_low_all()
     # main_high_all_FuncSpatial()
     # retrieval()
     # main_mindeye2_pretrain()
-    main_mindeye2_finetunning()
-
+    # main_mindeye2_finetunning_train()
+    main_mindeye2_inference_evaluate()
+    # main_mindeye2_pretrain_continous()
 

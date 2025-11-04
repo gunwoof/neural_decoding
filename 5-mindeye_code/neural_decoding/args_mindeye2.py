@@ -14,12 +14,20 @@ def parse_args2():
         help='device',
     )
     parser.add_argument(
-        "--num_epochs",type=int,default=150, choices=[1, 3, 150],
+        "--experiment_name", type=str, default="test",
+        help="experiment_name 새부이름"
+    )
+    parser.add_argument(
+        "--num_epochs",type=int,default=200, choices=[1, 3, 150],
         help="epoch 개수",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=10,
-        help="Batch size(H100:160, L40:90), if benchmark L40:30",
+        "--batch_size", type=int, default=30,
+        help="pretrain 30, finetuning 30",
+    )
+    parser.add_argument(
+        "--inference_batch_size",type=int,default=20,
+        help="versatile inference batch size(H100:25, L40:10)",
     )
     parser.add_argument(
         "--prefetch_factor", type=int, default=10, choices=[2,4,5,6,8,10],
@@ -45,7 +53,7 @@ def parse_args2():
         help="Path to the BIDS fmri_detail."
     )
     parser.add_argument(
-        "--image_dir", type=str, default="4-image/beta",
+        "--image_dir", type=str, default="4-image/nsd_beta_img",
         help="Path to the BIDS image."
     )
     parser.add_argument(
@@ -60,6 +68,17 @@ def parse_args2():
     parser.add_argument(
         "--cache_dir", type=str, default='/nas/research/03-Neural_decoding/5-mindeye_code/pretrained_cache',
         help="Where is cached Diffusion model; if not cached will download to this path",
+    )
+    parser.add_argument(
+        "--mindeye2_pretrined_model", type=str, default='/nas/research/03-Neural_decoding/5-mindeye_code/output/mindeye2_metric/mindeye2_pretrain_sub257.pt',
+        help="Where is cached Diffusion model; if not cached will download to this path",
+    )
+    parser.add_argument(
+        "--drop_pretrained_prefixes",
+        type=str,
+        nargs="*",
+        default=[],
+        help="State dict prefixes to drop when loading the pretrained MindEye2 weights.",
     )
     ####################
 
@@ -93,11 +112,11 @@ def parse_args2():
         help="prior loss 계수",
     )
     parser.add_argument(
-        "--nce_loss_coefficient",type=float,default=1.,
+        "--nce_loss_coefficient",type=float,default=1,
         help="multiply contrastive loss by this number",
     )
     parser.add_argument(
-        "--lowlevel_loss_coefficient",type=float,default=5.,
+        "--lowlevel_loss_coefficient",type=float,default=0.5,
         help="multiply loss from blurry recons by this number",
     )
     parser.add_argument(

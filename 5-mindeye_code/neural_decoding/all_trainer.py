@@ -67,7 +67,7 @@ def high_train_inference_evaluate(args, train_data, test_data, models, optimizer
             # data gpu 올리기 - amp 사용
             fmri_vol = fmri_vol.to(device, non_blocking=True)   # fMRI -> GPU
             image = image.to(device, non_blocking=True)         # Image -> GPU
-            
+          
             # image augmentation
             image = img_augment_high(image)
 
@@ -80,6 +80,7 @@ def high_train_inference_evaluate(args, train_data, test_data, models, optimizer
                 #### forward 계산 + loss 계산 ####
                 # target 정의
                 clip_target = clip_extractor.embed_image(image).float()
+                
                 # forward(MLP backbone) -> prior에 들어갈 embedding생성
                 clip_voxels, clip_voxels_proj = diffusion_prior.voxel2clip(fmri_vol)
                 clip_voxels = clip_voxels.view(len(fmri_vol),-1,clip_size) # [B, (257 * 768)] -> [B, 257, 768]
@@ -298,7 +299,7 @@ def high_train_inference_evaluate(args, train_data, test_data, models, optimizer
                 print(f"Final model saved to {save_path} (metric > 0.9)")
 
                 # save_recons 저장
-                recons_dir = os.path.join(args.root_dir, args.code_dir, args.output_dir, "recons")
+                recons_dir = os.path.join(args.root_dir, args.code_dir, args.output_dir, "recons_test")
                 save_gt_vs_recon_images(save_recons, recons_dir)
 
                 # 결과를 텍스트 파일로 저장
@@ -434,7 +435,7 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
         torch.cuda.empty_cache() # gpu 메모리 cache삭제
         gc.collect() # # gpu 메모리 안 쓰는거 삭제
 
-
+        # if epoch % 10 == 0:
         if epoch >= 50 and epoch % 10 == 0:
             #### inference ####
             all_recons = []
@@ -488,13 +489,7 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
             results["PixCorr"] = metrics["pixcorr"](all_recons, all_targets)
             results["SSIM"] = metrics["ssim"](all_recons, all_targets)
 
-            # CLIP / AlexNet / Inception 
-            results["CLIP"] = metrics["clip"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["clip"]["model"],
-                metrics["clip"]["preprocess"]
-            )
-
+            # AlexNet
             results["AlexNet_2"] = metrics["alexnet2"]["metric_fn"](
                 args, all_recons, all_targets,
                 metrics["alexnet2"]["model"],
@@ -509,15 +504,31 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
                 metrics["alexnet5"]["layer"]
             )
 
+            # CLIP / Inception / EfficientNet / SwAV
+            results["CLIP"] = metrics["clip"]["metric_fn"](
+                args, all_recons, all_targets,
+                metrics["clip"]["model"],
+                metrics["clip"]["preprocess"]
+            )
+
             results["Inception"] = metrics["inception"]["metric_fn"](
                 args, all_recons, all_targets,
                 metrics["inception"]["model"],
                 metrics["inception"]["preprocess"]
             )
-            
-            for name, score in results.items():
-                print(f"{name:12}: {score:.4f}")
-            # wandb.log({f"eval/epoch{epoch}_{k}": v for k, v in results.items()}, step=global_step)
+
+            results["EfficientNet_B1"] = metrics["efficientnet"]["metric_fn"](
+                args, all_recons, all_targets,
+                metrics["efficientnet"]["model"],
+                metrics["efficientnet"]["preprocess"]
+            )
+
+            results["SwAV"] = metrics["swav"]["metric_fn"](
+                args, all_recons, all_targets,
+                metrics["swav"]["model"],
+                metrics["swav"]["preprocess"]
+            )
+            wandb.log({f"eval/epoch{epoch}_{k}": v for k, v in results.items()}, step=global_step)
 
 
             # AlexNet_2이 0.65 이상이면 모델 저장
@@ -533,7 +544,7 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
                 # save_recons 저장
                 for img_id, img_tensor in save_recons.items():
                     img_tensor = img_tensor.clamp(0, 1)  # 이미지 값이 [0,1] 범위로 제한되어야 함
-                    save_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, "low_recons", f"{img_id}")  # 파일 경로 설정
+                    save_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, "low_recons_test", f"{epoch}_{img_id}")  # 파일 경로 설정
                     save_image(img_tensor, save_path)  # 이미지 저장
 
                 # 결과를 텍스트 파일로 저장
@@ -543,6 +554,7 @@ def low_train_inference_evaluate(args, train_data, test_data, models, optimizer,
                     for name, score in results.items():
                         f.write(f"{name}: {score:.4f}\n")
 
+            del all_recons, all_targets, save_recons, save_gts, results
             torch.cuda.empty_cache() # gpu 메모리 cache삭제
             gc.collect() # gpu 메모리 안 쓰는거 삭제
 

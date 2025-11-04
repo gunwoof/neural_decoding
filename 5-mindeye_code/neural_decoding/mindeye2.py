@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -45,7 +46,7 @@ class RidgeRegression(nn.Module):
         '''
             out: - shape: [batch, 4096]
         '''
-        out = self.linears[subj_idx](x).unsqueeze(1) # MLP-Mixer를 사용하기 위해 [B, 4096] -> [B, 1, 4096]
+        out = self.linears[subj_idx](x) # MLP-Mixer를 사용하기 위해 [B, 4096] -> [B, 1, 4096]
         return out
 
 # Difusion prior재료 + Retrieval 재료 + low-level 재료
@@ -58,6 +59,7 @@ class BrainNetwork(nn.Module):
         self.backbone_mlp = nn.ModuleList([
             self.mlp(h, h, drop) for _ in range(n_blocks)
         ])
+
         
         # Output linear layer
         self.backbone_linear = nn.Linear(h * seq_len, out_dim, bias=True) 
@@ -113,12 +115,17 @@ class BrainNetwork(nn.Module):
             x(projector): - shape: [batch, (256*1664)]
             x(low-level): - shape: ([batch, 4, 64, 64], [batch, 64, 512])
         '''
+
+        # if x.dim() == 2:
+        #     x = x.unsqueeze(1)  # allow direct [B, 4096] inputs
+
         # Residual MLP backbone
         residual = x
         for block in self.backbone_mlp:
             x = block(x) + residual
             residual = x
-        x = x.reshape(x.size(0), -1) # [B, 4096]
+
+        # x = x.reshape(x.size(0), -1) # [B, 4096]
         backbone = self.backbone_linear(x).reshape(len(x), -1, self.clip_size) # [B, 4096] -> [B, 256*1664] -> [B, 256, 1664]
 
         # make empty tensors
@@ -239,12 +246,28 @@ class PriorNetwork(nn.Module):
         # tokens.shape = [batch_size, total_token, dim]
         # total_token= [brain_embed(256개), time_embed(1개), image_embed(256개)] -> 이 중에서 맞춰야 할 embed
         self.num_tokens = num_tokens
+        self.self_cond = False 
+
+    # Classifier-Free Guidance(inference할 때만 사용)
+    def forward_with_cond_scale(self,*args,cond_scale = 1.,**kwargs):
+        # 모든 데이터가 condition이 적용된 prediction 값 - pure noise + cross attention
+        logits = self.forward(*args, **kwargs) 
+
+        if cond_scale == 1:
+            return logits
+
+        # 모든 데이터가 condition이 적용되지 않은 prediction 값 - pure noise
+        null_logits = self.forward(*args, brain_cond_drop_prob = 1, image_cond_drop_prob = 1, **kwargs) # mask가 모두 1
+
+        # condition이 있을 때와 없을 때의 차이를 계산 
+        return null_logits + (logits - null_logits) * cond_scale
 
     def forward(
         self,
         image_embed, # pure noise 
         diffusion_timesteps,
         *,
+        self_cond=None,
         text_embed=None,
     ):  
         # brain embed = text embed  
@@ -264,10 +287,10 @@ class PriorNetwork(nn.Module):
             image_embed = image_embed + pos_embs # pure noise로 만들어짐 -(forward)-> prediction 값
 
             tokens = torch.cat((
-                brain_embed,  # [b, 257, 768] 
+                brain_embed,  # [b, 256, 1664] 
                 time_embed,  # [b, 1, 768]
-                image_embed,  # [b, 257, 768]
-            ), dim = -2) # [b, 257 + 1 + 257 + 257, 768] = [b, 515, 768]
+                image_embed,  # [b, 256, 1664]
+            ), dim = -2) # [b, 256 + 1 + 256 , 768] = [b, 515, 1664]
 
         # transformer
         tokens = self.causal_transformer(tokens) # output: [b, 515, 768]
@@ -353,16 +376,17 @@ def get_pretrain_model(args):
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
         arch="ViT-bigG-14",
         version="laion2b_s39b_b160k",
-        output_tokens=True,
+        output_tokens=True
     )
 
     #### 학습하는 모델을 담을 객체 ####
     mindeye2 = MindEyeModule()
-        
-    #### ridge(Shared-subject latent space) 정의 ####
-    num_voxels_list = [14278, 13039, 12682] # subject 2,5,7
-    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096)
 
+    #### ridge(Shared-subject latent space) 정의 ####
+    # num_voxels_list = [14278, 13039, 12682] # subject 2,5,7
+    num_voxels_list = [15724, 14278, 13039, 12682] # subject 1,2,5,7
+    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096)
+        
     #### Residual MLP backbone 정의 ####
     mindeye2.backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664)
 
@@ -438,16 +462,16 @@ def get_model(args):
     clip_img_embedder = FrozenOpenCLIPImageEmbedder(
         arch="ViT-bigG-14",
         version="laion2b_s39b_b160k",
-        output_tokens=True,
+        output_tokens=True
     )
 
     #### 학습하는 모델을 담을 객체 ####
     mindeye2 = MindEyeModule()
-        
-    #### ridge(Shared-subject latent space) 정의 ####
-    num_voxels_list = [14278, 13039, 12682] # subject 2,5,7
-    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096).to(args.device)
 
+    #### ridge(Shared-subject latent space) 정의 ####
+    num_voxels_list = [15724, 14278, 13039, 12682] # subject 1,2,5,7
+    mindeye2.ridge = RidgeRegression(input_sizes=num_voxels_list, out_features=4096).to(args.device)
+        
     #### Residual MLP backbone 정의 ####
     mindeye2.backbone = BrainNetwork(h=4096, in_dim=4096, out_dim=256*1664, seq_len=1, n_blocks=4, clip_size=1664).to(args.device)
 
@@ -477,6 +501,27 @@ def get_model(args):
         cond_drop_prob=0.2,
         image_embed_scale=None,
     ).to(args.device)
+
+    # # finetuning을 위해 미리 학습된 mindeye2 모델 불러오기
+    # ckpt = torch.load(args.mindeye2_pretrined_model, map_location=args.device)
+    # missing, unexpected = mindeye2.load_state_dict(ckpt, strict=False)
+    # print(f" - missing keys: {missing}, - unexpected keys: {unexpected}")
+
+    # # subject1을 초기화 
+    # subj1_in_dim = num_voxels_list[-1]
+    # new_linear = nn.Linear(subj1_in_dim, 4096, bias=True)
+    # nn.init.kaiming_uniform_(new_linear.weight, a=math.sqrt(5))
+    # if new_linear.bias is not None:
+    #     fan_in, _ = nn.init._calculate_fan_in_and_fan_out(new_linear.weight)
+    #     bound = 1 / math.sqrt(fan_in)
+    #     nn.init.uniform_(new_linear.bias, -bound, bound)
+    # mindeye2.ridge.linears.append(new_linear)  # subject1용 weight 새로 초기화
+
+    # # 나머지 subject(2,5,7) weight 삭제 (메모리 절약)
+    # del mindeye2.ridge.linears[0:3]
+    # print(f"[디버그] ridge 내부 linears 개수: {len(mindeye2.ridge.linears)}")
+    # print(f"[디버그] ridge 내부 layer 구조:")
+    # print(f"  {[f'linears.{i}: ({layer.in_features} → {layer.out_features}, bias={layer.bias is not None})' for i, layer in enumerate(mindeye2.ridge.linears)]}")
 
     #### low-level 정의 ####
     #### encoder & decoder 정의 ####
@@ -525,7 +570,6 @@ def get_model(args):
     unclip_scale_factor       = unclip_params["scale_factor"]
     unclip_disable_first_stage_autocast = unclip_params["disable_first_stage_autocast"]
 
-    # sdxl unclip 정의
     unclip_first_stage_config['target'] = 'sgm.models.autoencoder.AutoencoderKL'
     unclip_sampler_config['params']['num_steps'] = 38
     sdxl_unclip_path = os.path.join(args.cache_dir, "generative_models", "unclip6_epoch0_step110000.ckpt")
@@ -539,7 +583,6 @@ def get_model(args):
     ckpt = torch.load(sdxl_unclip_path, map_location=args.device)
     sdxl_unclip.load_state_dict(ckpt['state_dict'])
     sdxl_unclip.eval().requires_grad_(False)
-
 
     # base config 정의
     base_cfg = OmegaConf.load("pretrained_cache/generative_models/configs/inference/sd_xl_base.yaml")
@@ -555,12 +598,14 @@ def get_model(args):
 
     # caption 임베더 (base conditioner 기준)
     base_text_embedder1 = FrozenCLIPEmbedder(
+        device=args.device,
         layer=base_conditioner_config['params']['emb_models'][0]['params']['layer'],
         layer_idx=base_conditioner_config['params']['emb_models'][0]['params']['layer_idx'],
     )
     base_text_embedder2 = FrozenOpenCLIPEmbedder2(
         arch=base_conditioner_config['params']['emb_models'][1]['params']['arch'],
         version=base_conditioner_config['params']['emb_models'][1]['params']['version'],
+        device=args.device,
         freeze=base_conditioner_config['params']['emb_models'][1]['params']['freeze'],
         layer=base_conditioner_config['params']['emb_models'][1]['params']['layer'],
         always_return_pooled=base_conditioner_config['params']['emb_models'][1]['params']['always_return_pooled'],
@@ -592,13 +637,12 @@ def get_model(args):
         "clip_linear": clip_linear,
         "clip_text_model": clip_text_model,
         "token_to_text": token_to_text,
+        "sdxl_unclip": sdxl_unclip,
         "base_text_embedder1": base_text_embedder1,
         "base_text_embedder2": base_text_embedder2,
         "sdxl": sdxl,
-        "sdxl_unclip": sdxl_unclip
     }
 
     return models
-
 
 

@@ -440,22 +440,22 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         num_time_embeds = 1, # time embedding 개수
         num_tokens = 257,
         causal = True,
-        learned_query_mode = 'none', 
+        learned_query_mode = 'none', # query 사용 방법
         **kwargs
     ):
         super().__init__()
         self.dim = dim # 768
         self.num_time_embeds = num_time_embeds
         self.continuous_embedded_time = not exists(num_timesteps) # time embedding값이 continous or descrete
-        self.learned_query_mode = learned_query_mode # 학습가능한 positional embedding
+        self.learned_query_mode = learned_query_mode # query가 학습되는 방법법
 
-        # time embedding으로 변환
+        # time embedding 변환
         self.to_time_embeds = nn.Sequential( 
             nn.Embedding(num_timesteps, dim * num_time_embeds) if exists(num_timesteps) else nn.Sequential(SinusoidalPosEmb(dim), MLP(dim, dim * num_time_embeds)), # also offer a continuous version of timestep embeddings, with a 2 layer MLP
             Rearrange('b (n d) -> b n d', n = num_time_embeds)
         )
 
-        # token
+        # query(pure noise로 만들어짐)
         if self.learned_query_mode == 'pos_emb': # image embedding + positional embedding
             scale = dim ** -0.5
             self.learned_query = nn.Parameter(torch.randn(num_tokens, dim) * scale)
@@ -463,51 +463,102 @@ class VersatileDiffusionPriorNetwork(nn.Module):
         # transformer 저장
         self.causal_transformer = FlaggedCausalTransformer(dim = dim, causal=causal, **kwargs)
 
+        # Classifier-Free Guidance: condition이 있을 때와 없을 때의 차이를 계산하기위해 사용되는 의미없는 embedding
+        self.null_brain_embeds = nn.Parameter(torch.randn(num_tokens, dim))
+        self.null_image_embed = nn.Parameter(torch.randn(num_tokens, dim))
+
         # tokens.shape = [batch_size, total_token, dim]
-        # total_token = [brain_embed(257개), time_embed(1개), image_embed(257개)] -> 이 중에서 맞춰야 할 embed
+        # total_token= [ brain_embed(257개), time_embed(1개), image_embed(257개) , learned_queries(257개)] -> 이 중에서 맞춰야 할 embed
         self.num_tokens = num_tokens # 예측해야할 vector 차원
         
+        # Self-conditioning: output을 input으로 사용하하여 output을 또 뽑음
+        self.self_cond = False 
+
+    # Classifier-Free Guidance(inference할 때만 사용)
+    def forward_with_cond_scale(self,*args,cond_scale = 1.,**kwargs):
+        # 모든 데이터가 condition이 적용된 prediction 값 - pure noise + cross attention
+        logits = self.forward(*args, **kwargs) 
+
+        if cond_scale == 1:
+            return logits
+
+        # 모든 데이터가 condition이 적용되지 않은 prediction 값 - pure noise
+        null_logits = self.forward(*args, brain_cond_drop_prob = 1, image_cond_drop_prob = 1, **kwargs) # mask가 모두 1
+
+        # condition이 있을 때와 없을 때의 차이를 계산 
+        return null_logits + (logits - null_logits) * cond_scale
 
     def forward(
         self,
-        image_embed, # pure noise 
+        image_embed, # query: pure noise 
         diffusion_timesteps,
         *,
+        self_cond=None,
+        brain_embed=None,
         text_embed=None,
+        brain_cond_drop_prob = 0., # dropout 확률
+        text_cond_drop_prob = None, # dropout 확률
+        image_cond_drop_prob = 0. # dropout 확률
     ):  
         # brain embed = text embed  
         if text_embed is not None:
             brain_embed = text_embed 
+        if text_cond_drop_prob is not None: 
+            brain_cond_drop_prob = text_cond_drop_prob 
         
         # shape 변경
         image_embed = image_embed.view(len(image_embed),-1,768) # image_embed.shape -> [B, 257, 768]
         brain_embed = brain_embed.view(len(brain_embed),-1,768) # brain_embed.shape -> [B, 257, 768]
         
         batch, _, dim, device, dtype = *image_embed.shape, image_embed.device, image_embed.dtype
+        
+        # classifier free guidance masks 생성: inference에서는 모두 1인것과 모두 0인것을 둘 다 뽑음
+        brain_keep_mask = prob_mask_like((batch,), 1 - brain_cond_drop_prob, device = device)
+        brain_keep_mask = rearrange(brain_keep_mask, 'b -> b 1 1') # brain_mask.shape -> [B, 1, 1]
+
+        image_keep_mask = prob_mask_like((batch,), 1 - image_cond_drop_prob, device = device)
+        image_keep_mask = rearrange(image_keep_mask, 'b -> b 1 1') # image_mask.shape -> [B, 1, 1]
+
+
+        # image_keep_mask에 해당하는 embedding값은 모두 0 or 1
+        null_brain_embeds = self.null_brain_embeds.to(brain_embed.dtype)
+        brain_embed = torch.where(
+            brain_keep_mask, # broadcast
+            brain_embed,
+            null_brain_embeds[None]
+        )
+
+        # image_keep_mask에 해당하는 embedding값은 모두 0 or 1
+        null_image_embed = self.null_image_embed.to(image_embed.dtype)
+        image_embed = torch.where( 
+            image_keep_mask, # broadcast
+            image_embed,
+            null_image_embed[None]
+        )
 
         # time_embedding
         if self.continuous_embedded_time:
             diffusion_timesteps = diffusion_timesteps.type(dtype)
         time_embed = self.to_time_embeds(diffusion_timesteps)
 
-        # token 정의
+        # query 정의
         if self.learned_query_mode == 'pos_emb':
             pos_embs = repeat(self.learned_query, 'n d -> b n d', b = batch) # repeat: '257 768' shape -> 'b 257 768' shape로 변경
-            image_embed = image_embed + pos_embs # pure noise로 만들어짐 -(forward)-> prediction 값
+            image_embed = image_embed + pos_embs # query(pure noise로 만들어짐) -(forward)-> prediction 값
 
             tokens = torch.cat((
-                brain_embed,  # [b, 257, 768] 
+                brain_embed,  # key, value로 사용: [b, 257, 768] 
                 time_embed,  # [b, 1, 768]
-                image_embed,  # [b, 257, 768]
-            ), dim = -2) # [b, 257 + 1 + 257 + 257, 768] = [b, 515, 768]
+                image_embed,  # query로 사용: [b, 257, 768]
+            ), dim = -2) # [b, 257 + 1 + 257 + 257, 768] = [b, 772, 768]
 
         # transformer
-        tokens = self.causal_transformer(tokens) # output: [b, 515, 768]
+        tokens = self.causal_transformer(tokens) # output: [b, 772, 768]
 
         pred_image_embed = tokens[..., -self.num_tokens:, :] # output: [b, 257, 768] - image_embed를 prediction값으로 사용
 
         return pred_image_embed
-
+        
 class FlaggedCausalTransformer(nn.Module):
     def __init__(
         self,

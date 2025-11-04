@@ -19,7 +19,7 @@ def parse_args():
         help='device',
     )
     parser.add_argument(
-        "--batch_size", type=int, default=300,
+        "--batch_size", type=int, default=160,
         help="Batch size(H100:160, L40:90), if benchmark L40:30",
     )
     parser.add_argument(
@@ -64,7 +64,7 @@ def parse_args():
         help="Path to the BIDS root."
     )
     parser.add_argument(
-        "--fmri_dir", type=str, default="3-bids/derivatives",
+        "--fmri_dir", type=str, default="3-bids/2-derivatives/1-beta",
         help="Path to the BIDS fmri."
     )
     parser.add_argument(
@@ -73,7 +73,7 @@ def parse_args():
         help="Path to the BIDS fmri_detail."
     )
     parser.add_argument(
-        "--image_dir", type=str, default="4-image/beta",
+        "--image_dir", type=str, default="4-image/nsd_beta_img",
         help="Path to the BIDS image."
     )
     parser.add_argument(
@@ -151,6 +151,10 @@ def parse_args():
     parser.add_argument(
         "--scheduler_type",type=str,default='cycle',
         choices=['cycle','linear'],
+    )
+    parser.add_argument(
+        "--num_subjects",type=int,default=1, choices=[1, 3, 7],
+        help="subject 개수",
     )
     ####################
 

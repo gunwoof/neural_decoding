@@ -248,7 +248,7 @@ def reconstruction(
     num_inference_steps = 50,
     recons_per_sample = 1, # mindeye에서는 16개
     inference_batch_size=1, # batch 중에서 몇 개만 저장할지 -> batch와 같이 줄 것
-    img_lowlevel = True, # low level image
+    img_lowlevel = None, # low level image
     guidance_scale = 3.5, # 기본 7.5
     img2img_strength = .85,
     plotting=True,
@@ -479,6 +479,60 @@ def save_gt_vs_recon_images(save_recons, save_dir):
         plt.close(fig)
 
     print(f"[완료] {len(save_recons)}개 이미지 저장 완료: {save_dir}")
+    
+def save_gt_vs_recon_images_extended( all_targets, all_recons, all_blurryrecons, all_enhanced_recons, all_final_recons, all_image_ids,save_dir, layout="horizontal"):
+    """
+    GT와 4종류의 재구성 이미지를 한 장에 모아 저장하는 함수 (Tensor 기반)
+
+    Args:
+        all_targets (torch.Tensor): [N, 3, H, W]
+        all_recons (torch.Tensor): [N, 3, H, W]
+        all_blurryrecons (torch.Tensor): [N, 3, H, W]
+        all_enhanced_recons (torch.Tensor): [N, 3, H, W]
+        all_final_recons (torch.Tensor): [N, 3, H, W]
+        all_image_ids (torch.Tensor): [N] 또는 list[int/str]
+        save_dir (str): 저장할 디렉토리
+        layout (str): 'horizontal' 또는 'vertical'
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    def tensor_to_image(t):
+        t = t.detach().cpu().clamp(0, 1)
+        return t.permute(1, 2, 0).numpy()
+
+    titles = ["Ground Truth", "Recon", "Blurry", "Enhanced", "Final"]
+
+    num_images = all_targets.shape[0]
+    for idx in range(num_images):
+        imgs = [
+            tensor_to_image(all_targets[idx]),
+            tensor_to_image(all_recons[idx]),
+            tensor_to_image(all_blurryrecons[idx]),
+            tensor_to_image(all_enhanced_recons[idx]),
+            tensor_to_image(all_final_recons[idx]),
+        ]
+
+        if layout == "horizontal":
+            fig, axes = plt.subplots(1, 5, figsize=(15, 3))
+        else:
+            fig, axes = plt.subplots(5, 1, figsize=(3, 15))
+
+        for i, ax in enumerate(axes):
+            ax.imshow(imgs[i])
+            ax.set_title(titles[i], fontsize=8)
+            ax.axis("off")
+
+        plt.tight_layout()
+
+        # 🔹 image_id가 torch.Tensor이면 int로 변환
+        img_id = all_image_ids[idx].item() if torch.is_tensor(all_image_ids[idx]) else all_image_ids[idx]
+        save_path = os.path.join(save_dir, f"{img_id}_comparison.png")
+
+        fig.savefig(save_path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+    print(f"[완료] {num_images}개 이미지 저장 완료: {save_dir}")
 
 def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, distributed=False):
     
@@ -503,34 +557,30 @@ def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, 
     return loss
 
 
-def unclip_recon(x, diffusion_engine, vector_suffix,
-                 num_samples=1, offset_noise_level=0.04):
-    assert x.ndim==3
-    if x.shape[0]==1:
-        x = x[[0]]
+def unclip_recon(x, diffusion_engine, vector_suffix, num_samples=1, offset_noise_level=0.04, device="cuda"):
     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16), diffusion_engine.ema_scope():
-        z = torch.randn(num_samples,4,96,96).to(device) # starting noise, can change to VAE outputs of initial image for img2img
+        batch_size = x.shape[0]
+        z = torch.randn(batch_size,4,96,96).to(device) # starting noise, can change to VAE outputs of initial image for img2img
 
-        # clip_img_tokenized = clip_img_embedder(image) 
-        # tokens = clip_img_tokenized
-        token_shape = x.shape
+        # cfg 준비하기 위해 c와 uc 준비
+        # 또한 stable diffusion에서 조건은 crossattn와 vector(전역조건) 2개인데 shape가 다름
         tokens = x
         c = {"crossattn": tokens.repeat(num_samples,1,1), "vector": vector_suffix.repeat(num_samples,1)}
-
         tokens = torch.randn_like(x)
         uc = {"crossattn": tokens.repeat(num_samples,1,1), "vector": vector_suffix.repeat(num_samples,1)}
 
-        for k in c:
-            c[k], uc[k] = map(lambda y: y[k][:num_samples].to(device), (c, uc))
+        # noise 생성
+        noise = torch.randn_like(z) # random값으로 초기화
+        sigmas = diffusion_engine.sampler.discretization(diffusion_engine.sampler.num_steps) # 각 step의 추가될 noise 만들어 놓음
+        sigma = sigmas[0].to(device)
 
-        noise = torch.randn_like(z)
-        sigmas = diffusion_engine.sampler.discretization(diffusion_engine.sampler.num_steps)
-        sigma = sigmas[0].to(z.device)
-
+        # 일반적인 gaussion noise에 추가 noise를 더하는 잡기술
         if offset_noise_level > 0.0:
             noise = noise + offset_noise_level * append_dims(
                 torch.randn(z.shape[0], device=z.device), z.ndim
             )
+
+        # XT(완전한 gaussian noise) 생성: z + sigma*epsilon
         noised_z = z + noise * append_dims(sigma, z.ndim)
         noised_z = noised_z / torch.sqrt(
             1.0 + sigmas[0] ** 2.0
@@ -539,8 +589,87 @@ def unclip_recon(x, diffusion_engine, vector_suffix,
         def denoiser(x, sigma, c):
             return diffusion_engine.denoiser(diffusion_engine.model, x, sigma, c)
 
-        samples_z = diffusion_engine.sampler(denoiser, noised_z, cond=c, uc=uc)
-        samples_x = diffusion_engine.decode_first_stage(samples_z)
+        # denosing 샘플링
+        samples_z = diffusion_engine.sampler(denoiser, noised_z, cond=c, uc=uc) # XT -> X0
+        samples_x = diffusion_engine.decode_first_stage(samples_z) # VAE decoder 통과
         samples = torch.clamp((samples_x*.8+.2), min=0.0, max=1.0)
-        # samples = torch.clamp((samples_x + .5) / 2.0, min=0.0, max=1.0)
         return samples
+    
+def sdxl_recon(inference_batch_size, image, prompt, base_engine, base_text_embedder1, base_text_embedder2, vector_suffix, crossattn_uc, vector_uc, num_samples=1, img2img_timepoint=13, device="cuda"):
+    """
+    SDXL base engine으로 coarse reconstruction을 refinement/upscale 하는 함수.
+    
+    Args:
+        image (Tensor): coarse reconstruction, shape (B,3,H,W), 값 범위 [0,1]
+        prompt (list[str]): caption prompt 리스트, 길이 B
+        base_engine: SDXL base DiffusionEngine
+        base_text_embedder1, base_text_embedder2: 텍스트 인코더
+        vector_suffix: conditioner에서 나온 전역 vector, shape (B,1024)
+        crossattn_uc, vector_uc: unconditional embedding (CFG용)
+        num_samples (int): 샘플링할 이미지 수
+        img2img_timepoint (int): 얼마나 noisy하게 다시 시작할지 (클수록 coarse하게 재샘플링)
+        device (str): 실행 디바이스
+    
+    Returns:
+        samples (Tensor): refinement된 이미지, shape (B,3,H,W)
+    """
+    with torch.no_grad(), base_engine.ema_scope():
+        
+        # 1. VAE encode
+        z = base_engine.encode_first_stage(image.to(device) * 2 - 1)  # (B,4,H',W')
+        z = z.repeat(num_samples, 1, 1, 1)                           # (num_samples*B,4,H',W')
+
+        # 2. 텍스트 condition 준비
+        openai_clip_text = base_text_embedder1(prompt)                       # (B, seq_len1, dim)
+        clip_text_tokenized, clip_text_emb = base_text_embedder2(prompt)     # (B, seq_len2, dim), (B, dim)
+        clip_text_emb = torch.hstack((clip_text_emb, vector_suffix))         # (B, dim+1024)
+
+        # 여기서는 cat 대신 stack/concat 주의: crossattn은 seq 방향 concat, vector는 단순 확장
+        clip_text_tokenized = torch.cat((openai_clip_text, clip_text_tokenized), dim=-1)  # (B, seq_len1+seq_len2, dim)
+
+        c = {
+            "crossattn": clip_text_tokenized.repeat(num_samples, 1, 1),  # (num_samples*B, total_seq, dim)
+            "vector": clip_text_emb.repeat(num_samples, 1)               # (num_samples*B, dim+1024)
+        }
+        uc = {
+            "crossattn": crossattn_uc.repeat(num_samples, 1, 1),
+            "vector": vector_uc.repeat(num_samples, 1)
+        }
+
+        # 3. 초기 노이즈 만들기 (img2img 방식)
+        base_engine.sampler.num_steps = 25
+
+        noise = torch.randn_like(z) # random값으로 초기화
+        sigmas = base_engine.sampler.discretization(base_engine.sampler.num_steps).to(device)  # 각 step의 추가될 noise 만들어 놓음
+
+        init_z = (z + noise * append_dims(sigmas[-img2img_timepoint], z.ndim)) / torch.sqrt(1.0 + sigmas[0]**2) # XT(완전한 gaussian noise) 생성: z + sigma*epsilon
+        
+        sigmas = sigmas[-img2img_timepoint:].repeat(inference_batch_size, 1)  # (inference_batch_size, steps)
+        base_engine.sampler.num_steps = sigmas.shape[-1] - 1
+
+
+        # 4. 샘플링 준비
+        noised_z, _, _, _, c, uc = base_engine.sampler.prepare_sampling_loop(
+            init_z, cond=c, uc=uc, num_steps=base_engine.sampler.num_steps
+        )
+
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            # 5. 디노이징 루프 XT -> X0
+            for timestep in range(base_engine.sampler.num_steps):
+                noised_z = base_engine.sampler.sampler_step(
+                    sigmas[:, timestep],
+                    sigmas[:, timestep+1],
+                    lambda x, sigma, c: base_engine.denoiser(base_engine.model, x, sigma, c),
+                    noised_z, cond=c, uc=uc, gamma=0
+                )
+
+        del noise, c, uc, sigmas
+        torch.cuda.empty_cache()
+
+        # 6. VAE decode
+        samples_x = base_engine.decode_first_stage(noised_z) # VAE decoder 통과
+        samples = torch.clamp((samples_x + 1.0) / 2.0, min=0.0, max=1.0)  # [0,1] 범위로 스케일링
+
+        enhanced_samples = torch.stack([transforms.Resize((224, 224), antialias=True)(img) for img in samples]).to(device)
+
+        return enhanced_samples

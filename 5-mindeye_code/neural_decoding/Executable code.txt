@@ -29,3 +29,7 @@ fc(1)_learnable_layer1_lowx: python neural_decoding/main.py --device "cuda:3" --
 fc(1)_learnable_layer1_highx: python neural_decoding/main.py --device "cuda:0" --is_fc --is_position --fmri_detail_dir "beta_hf_dk" --experiment_name "fc(1)_learnable_layer1_highx" --batch_size 90 --inference_batch_size 10 --prefetch_factor 5 --num_workers 10 
 
 python neural_decoding/main.py --device "cuda:3" --is_fc --is_position --fmri_detail_dir "beta_hf_dk" --inference_batch_size 20 --prefetch_factor 5 --num_workers 10 --mode "inference"
+
+
+mindeye1: python neural_decoding/main.py --device "cuda:3" --fmri_detail_dir "beta_huggingface" --experiment_name "mindeye_test" --batch_size 150 --inference_batch_size 25 --prefetch_factor 10 --num_workers 30
+mindeye1 low: python neural_decoding/main.py --device "cuda:3" --fmri_detail_dir "beta_huggingface" --experiment_name "mindeye_test" --batch_size 100 --inference_batch_size 20 --prefetch_factor 10 --num_workers 30 --no-use_low_image

@@ -417,7 +417,7 @@ def sub1_train_dataset_hug(args):
     image_dir = args.image_dir
     transform = transforms.ToTensor()
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/fmri_with_labels.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_train.npz"
     image_path = f"{root_dir}/{image_dir}"
  
     train_dataset = hug_TrainDataset(fmri_path, image_path, transform)
@@ -434,9 +434,9 @@ def sub1_test_dataset_hug(args):
     transform = transforms.ToTensor()
     use_low_image = args.use_low_image
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/fmri_with_labels_test.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_test.npz"
     image_path = f"{root_dir}/{image_dir}"
-    low_image_path = f"{root_dir}/{code_dir}/{output_dir}/low_recons"
+    low_image_path = f"{root_dir}/{code_dir}/{output_dir}/low_recons_test"
  
     test_dataset = hug_TestDataset(fmri_path, image_path, low_image_path, transform, use_low_image)
     
@@ -449,7 +449,7 @@ def sub1_train_dataset_FuncSpatial(args):
     image_dir = args.image_dir
     transform = transforms.ToTensor()
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/beta_hf_dk_train.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_train.npz"
     image_path = f"{root_dir}/{image_dir}"
  
     train_dataset = FuncSpatial_TrainDataset(fmri_path, image_path, transform)
@@ -466,7 +466,7 @@ def sub1_test_dataset_FuncSpatial(args):
     transform = transforms.ToTensor()
     use_low_image = args.use_low_image
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/beta_hf_dk_test.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_test.npz"
     image_path = f"{root_dir}/{image_dir}"
     low_image_path = f"{root_dir}/{code_dir}/{output_dir}/low_recons"
  
@@ -552,7 +552,7 @@ def get_dataloader_hug2(args, subj_names):
 
         # 여기서 batch_size는 각각의 개수임. 합첸 수 아님 ex) 각각 10 -> 전체 30 
         # 다만 fine-tunning에서는 subject 하나만 사용하니까 batch size를 올려도 됨
-        inference_loaders = DataLoader(multi_inference_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
+        inference_loaders = DataLoader(multi_inference_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
         return inference_loaders
 
 
@@ -564,14 +564,14 @@ def get_dataloader(args):
     # drop_idx = {1,4,11,14} # high
  
     if args.mode == 'train':
-        train_dataset = sub1_train_dataset_FuncSpatial(args)
+        train_dataset = sub1_train_dataset_hug(args)
         # keep_idx = [i for i in range(train_dataset.seq_len) if i not in drop_idx]
         # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_train(keep_idx))
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
         return train_loader
     
     if args.mode == 'inference':
-        test_dataset = sub1_test_dataset_FuncSpatial(args)
+        test_dataset = sub1_test_dataset_hug(args)
         # keep_idx = [i for i in range(test_dataset.seq_len) if i not in drop_idx]
         # test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_test(keep_idx))
         test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle)
