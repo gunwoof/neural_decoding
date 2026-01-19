@@ -46,6 +46,10 @@ def parse_args():
         "--num_workers", type=int, default=20,
         help="num_workers for dataloader"
     )
+    parser.add_argument(
+        "--val_size", type=int, default=10000,
+        help="Validation set size (train에서 분리)"
+    )
 
     ###### Data Paths ######
     parser.add_argument(

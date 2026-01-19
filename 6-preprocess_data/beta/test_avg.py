@@ -5,8 +5,8 @@ from pathlib import Path
 # =========================
 # inputs
 # =========================
-npy_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-05/sub-05_beta_test_schaefer100_T.npy")
-tsv_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-05/sub-05_beta_test.tsv")
+npy_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-07/sub-07_beta_test_schaefer100_T.npy")
+tsv_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-07/sub-07_beta_test.tsv")
 
 # =========================
 # outputs

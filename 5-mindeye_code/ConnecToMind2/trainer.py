@@ -36,18 +36,21 @@ from utils import soft_cont_loss, img_augment, versatile_diffusion_reconstruct, 
 # Main Training Loop
 # ============================================================================
 
-def train_evaluate_metric(args, train_loader, test_loaders, models, optimizer, lr_scheduler, metrics):
+def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, optimizer, lr_scheduler, metrics):
     """
     전체 학습 루프
 
     Epoch 로직:
-        - Epoch 0: train + evaluation + metric
+        - 매 Epoch: train + validation loss 계산
+          -> overfitting 모니터링
+
+        - Epoch 0: train + validation + evaluation + metric
           -> 초기 모델 성능 확인 (baseline)
 
-        - Epoch 1~249: train only
+        - Epoch 1~249: train + validation only
           -> 빠른 학습 진행
 
-        - Epoch 250+: train + (5 단위로 evaluation + metric)
+        - Epoch 250+: train + validation + (5 단위로 evaluation + metric)
           -> epoch 250, 255, 260, ... 에서 평가
           -> 모델이 수렴 단계에서 성능 모니터링
     """
@@ -86,7 +89,15 @@ def train_evaluate_metric(args, train_loader, test_loaders, models, optimizer, l
             optimizer, lr_scheduler, scaler,
             epoch, global_step
         )
-        print(f"[Epoch {epoch}] Average Loss: {avg_loss:.4f}")
+        print(f"[Epoch {epoch}] Train Loss: {avg_loss:.4f}")
+
+        # ============ Validation ============
+        val_loss = validate(args, model, vae, val_loader)
+        print(f"[Epoch {epoch}] Val Loss: {val_loss:.4f}")
+
+        # WandB logging
+        if args.wandb_log:
+            wandb.log({"train_loss": avg_loss, "val_loss": val_loss}, step=global_step)
 
         # ============ Evaluation + Metric ============
         # Epoch 0 또는 Epoch 250 이상에서 5 단위
@@ -325,6 +336,49 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, sca
     gc.collect()
 
     return global_step + len(train_loader), np.mean(losses_log)
+
+
+# ============================================================================
+# Validation Function
+# ============================================================================
+
+@torch.no_grad()
+def validate(args, model, vae, val_loader):
+    """
+    Validation loss 계산 (Diffusion 없이 loss만 계산)
+
+    Returns:
+        avg_loss: 평균 validation loss
+    """
+    device = args.device
+    model.eval()
+
+    losses = []
+
+    for fmri, image in val_loader:
+        fmri = fmri.to(device, non_blocking=True)
+        image = image.to(device, non_blocking=True)
+
+        # Forward
+        outputs = model(fmri, image, device)
+
+        # Q-Former losses
+        loss_fir = outputs["loss_fir"]
+        loss_fim = outputs["loss_fim"]
+
+        # Low-level L1 Loss
+        vae_target = vae.encode(2 * image - 1).latent_dist.mode() * 0.18215
+        loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
+
+        # Total loss (cnx 제외)
+        loss = (args.fir_weight * loss_fir
+                + args.fim_weight * loss_fim
+                + args.lowlevel_weight * (loss_l1 / 0.18215))
+
+        losses.append(loss.item())
+
+    model.train()
+    return np.mean(losses)
 
 
 # ============================================================================

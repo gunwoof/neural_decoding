@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.data import ConcatDataset
 from torch import nn
 from torch.utils.data.distributed import DistributedSampler
@@ -96,7 +96,7 @@ def test_dataset(args):
 
     datasets = {}
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_schaefer100_T.npy"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_schaefer100_T_avg.npy"
         stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli_test_schaefer100_T.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets[sub] = TestDataset_ourdata(fmri_path, stimuli_path, image_path, transform)
@@ -118,11 +118,20 @@ def get_dataloader(args):
     # drop_idx = {1,4,11,14} # high
 
     if args.mode == 'train':
-        train_ds = train_dataset(args)
-        # keep_idx = [i for i in range(train_ds.seq_len) if i not in drop_idx]
-        # train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_train(keep_idx))
+        full_ds = train_dataset(args)
+
+        # Train/Val split (seed 고정으로 매 실행마다 동일한 분리)
+        val_size = args.val_size  # default: 10000
+        train_size = len(full_ds) - val_size
+        train_ds, val_ds = random_split(
+            full_ds,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
-        return train_loader
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=False)
+        return train_loader, val_loader
 
     if args.mode == 'inference':
         test_datasets = test_dataset(args)

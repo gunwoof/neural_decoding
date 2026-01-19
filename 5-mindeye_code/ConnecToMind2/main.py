@@ -69,10 +69,11 @@ def main():
     # ============ 4. 데이터 로더 생성 ============
     print("\nLoading data...")
 
-    # Train loader
+    # Train + Validation loader
     args.mode = 'train'
-    train_loader = get_dataloader(args)
+    train_loader, val_loader = get_dataloader(args)
     print(f"  Train samples: {len(train_loader.dataset)}")
+    print(f"  Validation samples: {len(val_loader.dataset)}")
 
     # Test loaders (subject별 분리)
     args.mode = 'inference'
@@ -105,6 +106,7 @@ def main():
     trained_model = train_evaluate_metric(
         args=args,
         train_loader=train_loader,
+        val_loader=val_loader,
         test_loaders=test_loaders,  # subject별 분리된 dict
         models=models,
         optimizer=optimizer,

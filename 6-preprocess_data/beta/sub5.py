@@ -1,7 +1,7 @@
 import os
 import numpy as np
 
-sub = "sub-07"
+sub = "sub-05"
 base_dir = f"/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/{sub}"
 
 def transpose_save_memmap(in_path, out_path, chunk=256):
