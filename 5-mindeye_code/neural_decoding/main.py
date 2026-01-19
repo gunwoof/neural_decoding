@@ -9,7 +9,7 @@ import gc
 import atexit
 import numpy as np
 
-from accelerate import Accelerator
+# from accelerate import Accelerator
 import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -614,12 +614,12 @@ def main_mindeye2_inference_evaluate():
 
 if __name__ == "__main__":
     # main()
-    # main_high_all
+    main_high_all()
     # main_low_all()
     # main_high_all_FuncSpatial()
     # retrieval()
     # main_mindeye2_pretrain()
     # main_mindeye2_finetunning_train()
-    main_mindeye2_inference_evaluate()
+    # main_mindeye2_inference_evaluate()
     # main_mindeye2_pretrain_continous()
 

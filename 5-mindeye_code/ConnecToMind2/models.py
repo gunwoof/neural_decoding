@@ -1,581 +1,752 @@
+"""
+ConnecToMind2 - Model2 Implementation (Based on New Architecture Diagram)
+
+Architecture (from diagram):
+    fMRI [B, 200, (roi+padding)]
+        -> (a) Region-level embedding -> [B, 200, 768]
+        -> (b) Connectome-Q-former -> [B, 201, 768]
+        -> Linear layer -> [B, 257, 768]
+        -> L2 norm -> [B, 257, 768]
+        -> Versatile Diffusion -> Reconstructed Image [B, 512, 512]
+
+    Image [B, 224, 224]
+        -> CLIP ViT-L/14 -> Last hidden [B, 257, 1024]
+        -> Linear layer + L2 norm -> [B, 257, 768]
+
+Loss = FIR Loss (fMRI embedding vs CLIP embedding, MSE)
+     + Cross Entropy Loss (CLS token)
+     + Low-level Loss (L1 with target image)
+"""
+
 import os
-import math
-import numpy as np
-from torchvision import transforms
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-import PIL
-from functools import partial
-import glob
-from scipy.stats import pearsonr
-import gc
 
-# q-former에 CLIP ViT-H/14의 self-attention + ffn를 init
 from transformers import CLIPVisionModel
-from transformers import CLIPVisionModelWithProjection
+from diffusers import DiffusionPipeline
+from diffusers.models.autoencoder_kl import Decoder
 
-# stable unclip 2.1
-from diffusers import StableUnCLIPImg2ImgPipeline
+from convnext import ConvnextXL
 
-# 학습하는 모델을 담을 class
-class ConnecToMind2(nn.Module):
-    def __init__(self):
+
+# ============================================================================
+# CLIP Image Encoder (그림의 좌측 하단) - ViT-L/14
+# ============================================================================
+
+class CLIPImageEncoder(nn.Module):
+    """
+    CLIP ViT-L/14 이미지 인코더
+
+    그림 설명:
+        Image -> CLIP ViT-L/14 -> Last hidden [B, 257, 1280]
+                               -> Linear layer + L2 norm -> [B, 257, 768]
+                               -> CLS Token [B, 768] (for Cross Entropy Loss)
+    """
+    def __init__(self, pretrained_model="openai/clip-vit-large-patch14", freeze=True):
         super().__init__()
-    def forward(self, x):
-        return x
+        self.clip_model = CLIPVisionModel.from_pretrained(pretrained_model)
 
-class ConnectomeTransformer(nn.Module):
-    def __init__(self, seq_len=20, input_dim=2056, embed_dim=1280, nhead=8, num_layers=8, is_position=False, is_fc=False, fc_matrix_path=""):
+        if freeze:
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
+
+        # CLIP ViT-L/14 hidden size: 1024
+        self.clip_hidden_size = 1024
+        self.output_dim = 768
+
+        # Linear layer: [B, 257, 1024] -> [B, 257, 768]
+        self.proj = nn.Linear(self.clip_hidden_size, self.output_dim)
+
+    def forward(self, images):
+        """
+        Input: images [B, 3, 224, 224]
+        Output:
+            hidden_state [B, 257, 768] - Linear + L2 norm (for MSE Loss)
+            cls_token [B, 768] - CLS token (for Cross Entropy Loss)
+        """
+        outputs = self.clip_model(images, output_hidden_states=True)
+        last_hidden = outputs.last_hidden_state  # [B, 257, 1024]
+
+        # Linear layer + L2 norm
+        hidden_state = self.proj(last_hidden)  # [B, 257, 768]
+        hidden_state = F.normalize(hidden_state, dim=-1)  # L2 norm
+
+        return hidden_state
+
+
+# ============================================================================
+# Region-level Embedding (그림의 (a))
+# ============================================================================
+
+class RegionLevelEmbedding(nn.Module):
+    """
+    (a) Region-level embedding
+
+    그림 설명:
+        task-fMRI [B, 200, (roi+padding)]
+        -> Flatten -> Linear projection -> [B, 200, 768]
+    """
+    def __init__(self, seq_len=200, input_dim=3291, embed_dim=768):
         super().__init__()
-
         self.embed_dim = embed_dim
         self.seq_len = seq_len
-        self.is_position = is_position
 
-        # roi별로 다른 weight의 linear layer (seq_len x input_dim x embed_dim) -> einsum 사용
-        self.linear1_weight = nn.Parameter(torch.empty(seq_len, input_dim, embed_dim))
+        # Region-level embedding: ROI별로 다른 linear layer
+        self.linear_weight = nn.Parameter(torch.empty(seq_len, input_dim, embed_dim))
         for t in range(seq_len):
-            init.xavier_uniform_(self.linear1_weight[t]) # xavier_uniform 초기화
-        self.layernorm1 = nn.LayerNorm(embed_dim)
+            init.xavier_uniform_(self.linear_weight[t])
+
+        self.layernorm = nn.LayerNorm(embed_dim)
         self.gelu = nn.GELU()
-        self.dropout1 = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.1)
 
-        # positional embedding
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, embed_dim))
-
-        if is_fc:
-            encoder_layer = CustomTransformerEncoderLayer(fc_matrix_path=fc_matrix_path, d_model=embed_dim, nhead=nhead)
-        else:
-            encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers) # num_layers개 쌓음
-            
     def forward(self, x):
-        '''
-            x.shape [batch_size, roi개수, (voxel개수+padding)] -> [batch_size, roi개수, 1280]
-        '''
-        #### region-level fMRI embeddings ####
-        x = torch.einsum("btd,tdh->bth", x, self.linear1_weight) # [B, roi개수, (voxel개수+padding)] -> [B, roi개수, 1280] - 각 roi마다 linear layer
-        x = self.layernorm1(x)
+        """
+        Input: x [B, 200, input_dim]
+        Output: x [B, 200, 768]
+        """
+        # Region-level embedding (각 ROI별 linear)
+        x = torch.einsum("btd,tdh->bth", x, self.linear_weight)  # [B, 200, 768]
+        x = self.layernorm(x)
         x = self.gelu(x)
-        x = self.dropout1(x)
-
-        #### Connectome-Transformer ####
-        x = x + self.pos_embedding # positional embedding
-        x = self.transformer_encoder(x)  # [B, 20, 1280] -> [B, 20, 1280]
-
-        return x
-    
-class CustomTransformerEncoderLayer(nn.Module):
-    def __init__(self, fc_matrix_path, d_model, nhead, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.fc_matrix_path = fc_matrix_path
-        self.self_attn = CustomMultiheadAttention(d_model, nhead, dropout=dropout)
-
-        # Feedforward network
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        # Normalization and dropout
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-        # Activation function
-        self.activation = F.gelu
-
-    def forward(self, x, src_mask=None, is_causal=False, src_key_padding_mask=None):
-        # Self-attention block
-        residual = x
-        x = self.self_attn(x, self.fc_matrix_path)
-        x = residual + self.dropout1(x)
-        x = self.norm1(x)
-
-        # Feedforward block
-        residual = x
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = residual + self.dropout2(x)
-        x = self.norm2(x)
-
+        x = self.dropout(x)
         return x
 
-class CustomMultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0.1, bias=True):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
 
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        self.dropout = nn.Dropout(dropout)
+# ============================================================================
+# Connectome-Q-Former (그림의 (b))
+# ============================================================================
 
-    def forward(self, x, fc_matrix_path):
-        B, T, E = x.shape
-        
-        # q, k, v 한 번에 계산하고 쪼갬
-        qkv = self.qkv_proj(x)  # (B, T, 3E)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-
-        # FC 사용
-        fc_matrix = np.load(fc_matrix_path)        # shape (T, T)
-        fc_matrix = torch.from_numpy(fc_matrix).float().to(x.device)
-        fc_matrix = fc_matrix.unsqueeze(0).unsqueeze(0)
-        fc_matrix = fc_matrix.expand(B, 1, T, T)
-        attn_scores = attn_scores + fc_matrix * 0.7
-
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        attn_output = torch.matmul(attn_weights, v)  # (B, H, T, D)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, E)
-
-        out = self.out_proj(attn_output)
-
-        return out
-
-class FMRIImageAligner(nn.Module):
+class ConnectomeQFormerBlock(nn.Module):
     """
-    fMRI ↔ Image 정렬 (FIC) + 멀티모달 매칭 (FIM) 모델
+    Connectome-Q-Former 블록: Self-attention + Cross-attention (optional) + Feed forward
 
-    input:
-        fmri_emb: [B, 20, 1280]   (fMRI embedding)
-        image_hidden_state: [B, 257, 1280]  (ViT-H/14 embedding; idx0 = CLS/global)  
-        image_emb: [B, 1024]  (CLIP image embedding; for FIC loss)
-
-    내부 동작:
-      FIC branch:
-        query+image [B,257+257,1280], mask [257+257,257+257] -> q-former -> fic_query_embedding [B,257,1280], fic_image_embedding [B,257,1280]
-      FIM branch:
-        query+image [2B,257+257,1280], mask [257+257,257+257] -> q-former -> fim_logits [2B]
-
-    output:
-        {
-            "fic_query_embedding" [B,257,1280]
-            "fic_image_embedding" [B,257,1280]
-            "fim_logits" [2B]
-            "fim_labels" [2B]
-        }
+    그림 설명:
+        Self-attention (🔥 trainable)
+        Cross-attention (🔥 trainable) - 2 layer마다 한 번
+        Feed forward (🔥 trainable)
     """
-    def __init__(
-        self,
-        num_query_tokens=257,     # ViT-H/14 default
-        hidden_size=1280,         # ViT-H/14 default
-        num_heads=16,            # ViT-H/14 default
-        num_layers=32,           # ViT-H/14 default
-        cross_attention_freq=2,  # BLIP-2 default
-        intermediate_size=5120,  # ViT-H/14 default (=1280*4)
-        dropout=0.1,             # BLIP-2 default
-        layer_norm_eps=1e-12,    # BLIP-2 default
-    ):
+    def __init__(self, hidden_size=768, num_heads=12, intermediate_size=3072,
+                 dropout=0.1, layer_norm_eps=1e-6):
         super().__init__()
 
-        self.hidden_size = hidden_size
-        self.num_query_tokens = num_query_tokens
-
-        # #### projection ####
-        # self.fmri_proj = nn.Linear(1280, hidden_size)   # [B,20,1280] -> [B,20,1280]
-        # self.image_proj = nn.Linear(1280, hidden_size)   # [B,257,1280] -> [B,257,1280]
-
-        #### learnable query tokens (shared across FIC / FIM) ####
-        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, hidden_size)) # [1,257,1280] -> broadcast to [B,257,1280]
-
-        #### q_former ####
-        self.q_former = QFormerEncoder(
-            num_layers=num_layers,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            intermediate_size=intermediate_size,
-            dropout=dropout,
-            layer_norm_eps=layer_norm_eps,
-            cross_attention_freq=cross_attention_freq,
-            num_query_tokens=num_query_tokens,
-        )
-
-        #### heads ####
-        # FIC classifier head
-        self.fic_classifier = nn.Linear(hidden_size, 1024)
-        # FIM classifier head
-        self.fim_classifier = nn.Linear(hidden_size, 1)
-
-        #### losses ####
-        # FIC: align loss
-        self.fic_loss_fn = Blip2FICLoss()
-        # FIM: positive match + negative match
-        self.fim_loss_fn = Blip2FIMLoss()
-    
-    def build_mask(self, kind, n_q, n_t, device):
-        """
-            mask: [L, L] bool 행렬 (True=차단, False=허용)
-            if fim : 전범위 양방향
-            if fic : Q와 T 상호 차단(블록 대각)
-        """
-        # nn.MultiheadAttention은 True:무시 & False:실행 -> zero로 초기화 = 모두 허용
-        L = n_q + n_t
-        mask = torch.zeros(L, L, dtype=torch.bool, device=device)
-
-        if kind == "fim":
-            return mask
-
-        if kind == "fic":
-            mask[:n_q, n_q:] = True                        # Q -> T 차단
-            mask[n_q:, :n_q] = True                         # T -> Q 차단
-            return mask
-
-    def forward(self, args, fmri_emb, image_hidden_state, image_emb):
-        """
-            fmri_emb: [B, 20, 1280]   (fMRI embedding)
-            image_hidden_state: [B, 257, 1280]  (ViT-H/14 embedding; idx0 = CLS/global)  
-            image_emb: [B, 1024]  (CLIP image embedding; for FIC loss)
-            returns: dict
-                {   
-                    "fic_query_embedding" [B,1024]
-                    "fic_image_embedding" [B,1024]
-                    "fim_logits" [2B]
-                    "fim_labels" [2B]
-                }
-        """
-        B = fmri_emb.size(0)
-        # query tokens
-        query_tokens = self.query_tokens.expand(B, -1, -1)  # [B,257,1280]
-
-        n_q = query_tokens.size(1)   # 보통 257
-        n_t = image_hidden_state.size(1)    # 보통 257
-
-        #### FIC branch ####
-        q_i_fic = torch.cat([query_tokens, image_hidden_state], dim=1) # [B,257+257,1280]
-        # q-former에 넣을 mask들 생성
-        fic_attn_mask = self.build_mask("fic", n_q, n_t, device=args.device)  # [257+257,257+257] bool
-        # q-former(self attention with all + cross-attn between only query and fMRI + FFN with all)
-        q_i_hidden_fic = self.q_former(q_i_fic, fmri_emb, fic_attn_mask)  # [B,257+257,1280]
-        # query projection + mean pooling + l2norm
-        q_tokens_fic = q_i_hidden_fic[:, :n_q, :] #  query 토큰만 선택 [B,257,1280]
-        q_proj_fic = self.fic_classifier(q_tokens_fic) # projection [B,257,1024]
-        z_q_fic = q_proj_fic.mean(dim=1) # mean pooling [B,1024]
-        z_q_fic = F.normalize(z_q_fic, dim=-1) # l2norm [B,1024]
-
-        #### FIM branch ####
-        # negative를 위해 image embedding 섞기
-        perm = torch.randperm(B, device=args.device)
-        # 2B(positive+negative)로 확장
-        query_tokens_2b = torch.cat([query_tokens, query_tokens], dim=0) # [2B,257,1280]
-        image_feats_2b = torch.cat([image_hidden_state, image_hidden_state[perm]], dim=0) # [2B,257,1280]
-        fmri_feats_2b  = torch.cat([fmri_emb, fmri_emb], dim=0) # [2B,20,1280]
-        fim_labels_2b = torch.cat([torch.ones(B,device=args.device), torch.zeros(B,device=args.device)], dim=0) # [2B]
-        # q-former에 넣을 mask들 생성
-        fim_attn_mask = self.build_mask("fim", n_q, n_t, device=args.device)  # [257+257,257+257] bool        
-        # q-former(self attention with all + cross-attn between only query and fMRI + FFN with all)
-        q_i_fim = torch.cat([query_tokens_2b, image_feats_2b], dim=1) # [2B,257+257,1280]
-        q_i_hidden_fim = self.q_former(q_i_fim, fmri_feats_2b, fim_attn_mask)  # [2B,514,1280]
-        # cls + logit linear layer(1280,1)
-        fused_cls = q_i_hidden_fim[:, self.num_query_tokens, :]  # image부분의 cls token 뽑기 [2B,1280]
-        fim_logits = self.fim_classifier(fused_cls).squeeze(-1)  # logit계산(linear layer) [2B,1280] -> [2B]
-
-        reps = {
-            "fic_query_embedding": z_q_fic,  # [B,1024]
-            "fic_image_embedding": image_emb,  # clip에서 image_embeds를 바로 가져옴 [B,1024]
-            "fim_logits": fim_logits,     # [2B]
-            "fim_labels": fim_labels_2b,  # [2B]
-        }
-        return reps
-
-    # compute_loss
-    def compute_loss(self, representations):
-        """
-        representations: dict output from forward()
-            must contain q_hidden, t_hidden, itm_logits
-        itm_labels: [B] or [B,1] with {0,1}, optional
-        """
-        fic_query_embedding = representations["fic_query_embedding"]     # [B,1024]
-        fic_image_embedding = representations["fic_image_embedding"]     # [B,1024]
-        fim_logits = representations["fim_logits"] # [2B]
-        fim_labels = representations["fim_labels"] # [2B]
-
-        #### FIC MSE (fine-grained alignment of all tokens) ####
-        loss_fic = self.fic_loss_fn(fic_query_embedding, fic_image_embedding) # scalar
-
-        #### FIM BCE (binary match) ####
-        loss_fim = self.fim_loss_fn(fim_logits, fim_labels)  # scalar
-
-        return {
-            "loss_fic": loss_fic, # scalar
-            "loss_fim": loss_fim,  # scalar 
-        }
-    
-    def inference(self, fmri_emb):
-        """
-            input:
-                fmri_emb: [B, 20, 1280]   (fMRI embedding)
-            returns: 
-                fic_query_embedding: [B,257,1280]
-        """
-        B = fmri_emb.size(0)
-        # query tokens
-        query_tokens = self.query_tokens.expand(B, -1, -1)  # [B,257,1280]
-        query_hidden = self.q_former(query_tokens, fmri_emb, attn_mask=None)  # [B, 257, 1280]
-        # query projection + mean pooling + l2norm
-        q_proj_fic = self.fic_classifier(query_hidden) # projection [B,257,1024]
-        z_q_fic = q_proj_fic.mean(dim=1) # mean pooling [B,1024]
-        z_q_fic = F.normalize(z_q_fic, dim=-1) # l2norm [B,1024]
-        return z_q_fic
-
-
-class QFormerEncoder(nn.Module):
-    """
-        - QFormerEncoderBlock을 CLIPVisionModel(laion/CLIP-ViT-H-14-laion2B-s32B-b79K)기준으로 init 
-        - QFormerEncoderBlock을 num_layers개 쌓음
-        - cross_attention_freq 간격으로 cross-attn 블록 배치 (예: 2 => 2,4,6,...번째 레이어에서 cross-attn)
-        - 입력: [B, 257+257, 1280]  (concat of [queries, images]), fmri_feats: [B, 20, 1280], attn_mask:  [257+257, 257+257] (train) or None (inference)
-        - 출력: [B, 257+257, 1280]
-    """
-    def __init__(
-        self,
-        pretrained_vision_model = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-        cross_attention_freq = 2,
-        num_query_tokens = 257,
-        dropout = 0.1, 
-    ):
-        super().__init__()
-        vision = CLIPVisionModel.from_pretrained(pretrained_vision_model)
-        # getattr로 vision.config 접근 (vision.config.vision_config가 있으면 사용, 없으면 vision.config 사용) -> 버전 차이 대응
-        vcfg = getattr(vision.config, "vision_config", vision.config)
-
-        # CLIP-ViT-H-14을 기준으로 q-former setting 
-        self.hidden_size = vcfg.hidden_size # 1280
-        self.num_heads = vcfg.num_attention_heads # 16
-        self.intermediate_size = vcfg.intermediate_size # 5120
-        self.layer_norm_eps = vcfg.layer_norm_eps # 1e-05
-        self.num_layers = vcfg.num_hidden_layers # 32
-        self.num_query_tokens = num_query_tokens
-        self.cross_attention_freq = cross_attention_freq
-
-        # 레이어별 cross-attn 적용 여부 미리 계산
-        self._do_cross_map = [
-            (cross_attention_freq > 0) and ((i + 1) % cross_attention_freq == 0)
-            for i in range(self.num_layers)
-        ]
-
-        self.blocks = nn.ModuleList([
-            QFormerEncoderBlock(
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                intermediate_size=self.intermediate_size,
-                dropout=dropout,
-                layer_norm_eps=self.layer_norm_eps,
-            )
-            for _ in range(self.num_layers)
-        ])
-
-        # CLIP-ViT-H-14 q-former에 init (Self-Attn + FFN)
-        debugger = WeightDebugger()
-        for i, blk in enumerate(self.blocks):
-            clip_blk = vision.vision_model.encoder.layers[i]
-
-            debugger.debug_load(blk.self_ln1, clip_blk.layer_norm1, "self_ln1", i)
-            debugger.debug_load(blk.self_attn, clip_blk.self_attn, "self_attn", i)
-            debugger.debug_load(blk.self_ln2, clip_blk.layer_norm2, "self_ln2", i)
-            debugger.debug_load(blk.fc1, clip_blk.mlp.fc1, "fc1", i)
-            debugger.debug_load(blk.fc2, clip_blk.mlp.fc2, "fc2", i)
-        print(f"✅ Loaded CLIP pretrained weights for {self.num_layers} layers (Self-Attn + FFN only).")
-
-        # load_state_dict는 weight만 저장 -> CLIP-ViT-H-14 메모리 해제
-        del vision
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def forward(self, x, fmri_feats, attn_mask=None):
-        """
-            x: [B, n_q+n_img, D]
-            fmri_feats: [B, T, D]
-            attn_mask: [n_q+n_img, n_q+n_img] (bool) or None
-        """
-        n_q = self.num_query_tokens
-        for i, blk in enumerate(self.blocks):
-            x = blk(
-                x,
-                fmri_feats=fmri_feats,
-                attn_mask=attn_mask,
-                n_q=n_q,
-                do_cross=self._do_cross_map[i],
-            )
-        return x
-    
-class WeightDebugger:
-    def __init__(self, atol=1e-6):
-        self.atol = atol
-
-    def debug_load(self, target_module, source_module, name, layer_idx):
-        target_module.load_state_dict(source_module.state_dict())
-        for k, v in source_module.state_dict().items():
-            t = target_module.state_dict()[k]
-            same = torch.allclose(t, v, atol=self.atol)
-            print(f"[{layer_idx:02d}] {name}.{k:<28} | mean={v.mean():.6f}, std={v.std():.6f}, ok={same}")
-
-# # 하나의 Q-former block(Self-Attention layer 1개 + (선택) Cross-Attention layer 1개 + FFN layer 1개)
-class QFormerEncoderBlock(nn.Module):
-    """
-        - Self-Attention (query+image)
-        - (선택) Cross-Attention (앞쪽 n_q query -> fmri_feats)
-        - FFN (query+image)
-        * 모듈은 항상 생성하고, 적용 여부는 forward의 do_cross로 제어 (init에 조건문 없음)
-    """
-    def __init__(
-        self,
-        hidden_size,
-        num_heads,
-        intermediate_size,
-        dropout = 0.1,
-        layer_norm_eps = 1e-05,
-    ):
-        super().__init__()
-
-        # (필수) Self-Attention layer 1개: (query+image) 
-        self.self_ln1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.self_attn = nn.MultiheadAttention( embed_dim=hidden_size, num_heads=num_heads, dropout=dropout, batch_first=True)
+        # Self-Attention
+        self.self_ln = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
         self.self_drop = nn.Dropout(dropout)
 
-        # (선택) Cross-Attention layer 1개: query(앞 n_q 토큰) -> fmri_feats
+        # Cross-Attention (query tokens attend to fMRI) - Query만 LayerNorm (BLIP-2 방식)
         self.cross_ln = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.cross_attn = nn.MultiheadAttention( embed_dim=hidden_size, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
         self.cross_drop = nn.Dropout(dropout)
 
-        # FFN layer 1개: (query+image)
-        self.self_ln2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        # Feed Forward
+        self.ffn_ln = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
         self.fc1 = nn.Linear(hidden_size, intermediate_size)
         self.fc2 = nn.Linear(intermediate_size, hidden_size)
         self.ffn_drop = nn.Dropout(dropout)
         self.activation = nn.GELU()
 
-    # 만약 mask가 None이면 inference 모드
-    def forward(self, x, fmri_feats=None, attn_mask=None, n_q: int = None, do_cross: bool = False):
+    def forward(self, x, fmri_feats, attn_mask=None, do_cross=True, n_q=None):
         """
-            input:
-                x: [B, 257+257, 1280]  (query + image concat)
-                fmri_feats: [B, 20, 1280]
-                attn_mask: [257+257, 257+257] bool or None
-                n_q: int (number of query tokens)
-            output:
-                x: [B, 257+257, 1280]  
+        Input:
+            x [B, L, 768] - query tokens (+ optional CLIP hidden states)
+                           L = n_q (inference) or n_q + n_t (training with mask)
+            fmri_feats [B, 200, 768] - fMRI embeddings
+            attn_mask: attention mask for Q-T separation
+            do_cross: whether to do cross-attention in this layer
+            n_q: number of query tokens (for extracting query part in cross-attention)
+        Output:
+            x [B, L, 768]
         """
-        # (필수) Self-Attention layer 1개: (query+image) 
+        # Self-Attention (with mask if provided)
         residual = x
-        x_norm = self.self_ln1(x)
-        x_sa, _ = self.self_attn(x_norm, x_norm, x_norm, attn_mask=attn_mask, need_weights=False)
+        x_norm = self.self_ln(x)
+        x_sa, _ = self.self_attn(x_norm, x_norm, x_norm,
+                                  attn_mask=attn_mask, need_weights=False)
         x = residual + self.self_drop(x_sa)
 
-        # (선택) Cross-Attention layer 1개: query(앞 n_q 토큰) -> fmri_feats
+        # Cross-Attention (query -> fMRI) - 조건부 실행, query 부분만
         if do_cross:
-            q = x[:, :n_q, :]   # [B, n_q, D]
-            kv = fmri_feats     # [B, T, D]
+            q = x[:, :n_q, :]  #  Query 부분만 cross-attention 적용 -> [B, n_q, 768]
             q_res = q
             q_norm = self.cross_ln(q)
-            q_ca, _ = self.cross_attn(q_norm, kv, kv, need_weights=False)
+            q_ca, _ = self.cross_attn(q_norm, fmri_feats, fmri_feats, need_weights=False)
             q = q_res + self.cross_drop(q_ca)
-            x = torch.cat([q, x[:, n_q:, :]], dim=1)
+            x = torch.cat([q, x[:, n_q:, :]], dim=1)  # Query + 나머지 다시 concat
 
-        # (필수) FFN layer 1개: (query+image)
+        # Feed Forward
         residual = x
-        x_norm = self.self_ln2(x)
+        x_norm = self.ffn_ln(x)
         x_ffn = self.fc2(self.ffn_drop(self.activation(self.fc1(x_norm))))
         x = residual + self.ffn_drop(x_ffn)
+
         return x
 
-class Blip2FICLoss(nn.Module):
+
+class ConnectomeQFormer(nn.Module):
     """
-        최소 구현 ITC(InfoNCE): query->image, image->query CE 평균
-        - 입력 임베딩은 이미 L2 정규화되었다고 가정
-        - learnable temperature만 선택적으로 제공
+    (b) Connectome-Q-Former (initialized from CLIP ViT-L/14)
+
+    그림 설명:
+        [B, 200, 768] (fMRI) + query tokens + CLIP hidden states
+        -> Connectome-Q-Former blocks (with attention mask)
+        -> [B, 201, 768]
+
+    Query tokens: 201개 (200 ROI + 1 CLS token)
+    Weights initialized from openai/clip-vit-base-patch16
+    Cross-attention: 2 layer마다 한 번 (BLIP-2 방식)
+    Layers: 12 (CLIP ViT-B/16 기준)
+
+    마스크 기반 Self-attention (models.py 방식):
+        Query + CLIP hidden states를 concat하여 처리
+        마스크로 Q-T 상호 attend 차단 -> 독립적 처리
     """
-    """
-        FIC(Fused-CLS Matching) = BCEWithLogitsLoss 
-            - 입력:
-                logits: [2B]
-                labels: [2B] (0/1)
-            - 출력:
-                loss (scalar)
-    """
-    def __init__(self, temperature_init: float = 0.07, learnable_temperature: bool = True):
+    def __init__(self, hidden_size=768, num_heads=12, num_layers=12,
+                 num_query_tokens=201, dropout=0.1, cross_attention_freq=2,
+                 clip_model_name="openai/clip-vit-base-patch16"):
         super().__init__()
-        init_logit_scale = math.log(1.0 / temperature_init)  # log(1/τ)
-        self.logit_scale = nn.Parameter(
-            torch.tensor(init_logit_scale, dtype=torch.float32),
-            requires_grad=learnable_temperature
+
+        self.hidden_size = hidden_size
+        self.num_query_tokens = num_query_tokens
+        self.num_layers = num_layers
+        self.cross_attention_freq = cross_attention_freq
+
+        # Cross-attention 적용 여부 미리 계산 (0, 2, 4, ... 번째 layer) - BLIP-2 방식
+        self._do_cross_map = [(cross_attention_freq > 0) and (i % cross_attention_freq == 0)
+                              for i in range(num_layers)]
+
+        # Learnable query tokens [1, 201, 768] - position embedding 없음
+        self.query_tokens = nn.Parameter(torch.randn(1, num_query_tokens, hidden_size))
+        nn.init.normal_(self.query_tokens, std=0.02)
+
+        # Connectome-Q-Former blocks (12 layers, CLIP ViT-B/16 기준)
+        self.blocks = nn.ModuleList([
+            ConnectomeQFormerBlock(hidden_size, num_heads, hidden_size * 4, dropout)
+            for _ in range(num_layers)
+        ])
+
+        # Final LayerNorm
+        self.final_ln = nn.LayerNorm(hidden_size)
+
+        # Initialize from CLIP weights
+        self._init_from_clip(clip_model_name)
+
+    def _init_from_clip(self, clip_model_name):
+        """CLIP ViT-B/16에서 weights 가져와서 초기화 (Self-Attention + FFN)"""
+        print(f"Initializing Q-Former from {clip_model_name}...")
+
+        clip_model = CLIPVisionModel.from_pretrained(clip_model_name)
+        clip_layers = clip_model.vision_model.encoder.layers
+
+        # CLIP ViT-B/16: 12 layers, hidden_size=768 (차원 일치!)
+        for i, (block, clip_layer) in enumerate(zip(self.blocks, clip_layers)):
+            # Self-Attention weights
+            # CLIP: layer_norm1 -> self_attn
+            block.self_ln.weight.data.copy_(clip_layer.layer_norm1.weight.data)
+            block.self_ln.bias.data.copy_(clip_layer.layer_norm1.bias.data)
+
+            # HuggingFace CLIP uses separate q_proj, k_proj, v_proj
+            # PyTorch MultiheadAttention uses combined in_proj_weight [3*hidden, hidden]
+            # Concatenate q, k, v weights into in_proj_weight
+            q_weight = clip_layer.self_attn.q_proj.weight.data
+            k_weight = clip_layer.self_attn.k_proj.weight.data
+            v_weight = clip_layer.self_attn.v_proj.weight.data
+            block.self_attn.in_proj_weight.data.copy_(torch.cat([q_weight, k_weight, v_weight], dim=0))
+
+            q_bias = clip_layer.self_attn.q_proj.bias.data
+            k_bias = clip_layer.self_attn.k_proj.bias.data
+            v_bias = clip_layer.self_attn.v_proj.bias.data
+            block.self_attn.in_proj_bias.data.copy_(torch.cat([q_bias, k_bias, v_bias], dim=0))
+
+            block.self_attn.out_proj.weight.data.copy_(clip_layer.self_attn.out_proj.weight.data)
+            block.self_attn.out_proj.bias.data.copy_(clip_layer.self_attn.out_proj.bias.data)
+
+            # FFN weights
+            # CLIP: layer_norm2 -> mlp (fc1 -> activation -> fc2)
+            block.ffn_ln.weight.data.copy_(clip_layer.layer_norm2.weight.data)
+            block.ffn_ln.bias.data.copy_(clip_layer.layer_norm2.bias.data)
+            block.fc1.weight.data.copy_(clip_layer.mlp.fc1.weight.data)
+            block.fc1.bias.data.copy_(clip_layer.mlp.fc1.bias.data)
+            block.fc2.weight.data.copy_(clip_layer.mlp.fc2.weight.data)
+            block.fc2.bias.data.copy_(clip_layer.mlp.fc2.bias.data)
+
+            # Cross-Attention은 랜덤 초기화 유지 (BLIP-2 방식)
+
+        # Final LayerNorm from CLIP post_layernorm
+        self.final_ln.weight.data.copy_(clip_model.vision_model.post_layernorm.weight.data)
+        self.final_ln.bias.data.copy_(clip_model.vision_model.post_layernorm.bias.data)
+
+        del clip_model
+        print(f"✅ Q-Former initialized from CLIP ViT-B/16 (12 layers, hidden_size=768)")
+
+    def build_mask(self, n_q, n_t, device):
+        """
+        Attention mask 생성 (models.py 방식)
+
+             Q    T
+        Q  [□□] [■■]
+        T  [■■] [□□]
+
+        □: attend 가능 (False)
+        ■: attend 불가 (True)
+
+        -> Q끼리만 attend, T끼리만 attend (상호 차단)
+        """
+        L = n_q + n_t
+        mask = torch.zeros(L, L, dtype=torch.bool, device=device)
+        mask[:n_q, n_q:] = True  # Q -> T 차단
+        mask[n_q:, :n_q] = True  # T -> Q 차단
+        return mask
+
+    def forward(self, fmri_emb, clip_hidden=None, use_mask=True):
+        """
+        Input:
+            fmri_emb [B, 200, 768]
+            clip_hidden [B, 257, 768] (optional) - CLIP hidden states for masked self-attention
+            use_mask: True=Q-T 상호 차단 (FIR용), False=전범위 허용 (FIM용)
+        Output:
+            query_output [B, 201, 768]
+        """
+        B = fmri_emb.size(0)
+        device = fmri_emb.device
+
+        # fMRI features (position embedding 없음)
+        fmri_feats = fmri_emb  # [B, 200, 768]
+
+        # Expand query tokens for batch (position embedding 없음)
+        query = self.query_tokens.expand(B, -1, -1)  # [B, 201, 768]
+
+        # Concat query + CLIP hidden states (if provided)
+        if clip_hidden is not None:
+            # [B, 201, 768] + [B, 257, 768] -> [B, 458, 768]
+            x = torch.cat([query, clip_hidden], dim=1)
+            n_q = self.num_query_tokens
+            n_t = clip_hidden.size(1)
+            # use_mask=False: 전범위 허용 (FIM용) vs use_mask=True: Q-T 상호 차단 (MSE용)
+            attn_mask = self.build_mask(n_q, n_t, device) if use_mask else None
+        else:
+            x = query
+            attn_mask = None
+
+        # Pass through Connectome-Q-Former blocks
+        for i, block in enumerate(self.blocks):
+            x = block(x, fmri_feats, attn_mask=attn_mask, do_cross=self._do_cross_map[i], n_q=self.num_query_tokens)
+
+        # Extract query part only (if CLIP hidden was concatenated)
+        if clip_hidden is not None:
+            query_output = x[:, :self.num_query_tokens, :]  # [B, 201, 768]
+        else:
+            query_output = x
+
+        # Final LayerNorm
+        query_output = self.final_ln(query_output)  # [B, 201, 768]
+
+        return query_output
+
+
+# ============================================================================
+# Low-Level Image Decoder
+# ============================================================================
+
+class LowLevelDecoder(nn.Module):
+    """
+    fMRI 임베딩에서 Low-level (blurry) 이미지 생성 (MindEye2 방식)
+
+    input:
+        fmri_emb: [B, 200, 768]
+    output:
+        lowlevel_l1: [B, 4, 28, 28] - VAE latent space (L1 loss용, 224x224 이미지 기준)
+        lowlevel_aux: [B, 49, 512] - ConvNext feature space (contrastive loss용)
+    """
+    def __init__(self, seq_len=200, embed_dim=768):
+        super().__init__()
+
+        self.flatten_dim = seq_len * embed_dim  # 200 * 768 = 153600
+
+        # fmri_emb -> [B, 64, 7, 7] feature map (64*7*7 = 3136)
+        self.blin1 = nn.Linear(self.flatten_dim, 64 * 7 * 7, bias=True)
+        self.bdropout = nn.Dropout(0.3)
+        self.bnorm = nn.GroupNorm(1, 64)
+
+        # [B, 64, 7, 7] -> [B, 4, 28, 28] (VAE latent space, 3개 UpBlock으로 4x upsampling)
+        self.bupsampler = Decoder(
+            in_channels=64,
+            out_channels=4,
+            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"],
+            block_out_channels=[32, 64, 128],
+            layers_per_block=1,
         )
-        self.ce = nn.CrossEntropyLoss()
 
-    def forward(self, query_emb: torch.Tensor, image_emb: torch.Tensor) -> torch.Tensor:
-        # query_emb, image_emb: [B, D], 이미 L2 정규화된 상태
-        B = query_emb.size(0)
+        # [B, 64, 7, 7] -> [B, 49, 512] (ConvNext feature space)
+        self.b_maps_projector = nn.Sequential(
+            nn.Conv2d(64, 512, 1, bias=False),
+            nn.GroupNorm(1, 512),
+            nn.ReLU(True),
+            nn.Conv2d(512, 512, 1, bias=False),
+            nn.GroupNorm(1, 512),
+            nn.ReLU(True),
+            nn.Conv2d(512, 512, 1, bias=True),
+        )
 
-        scale = self.logit_scale.exp().clamp(max=100.0)  # 안정성 위해 살짝 상한
+    def forward(self, fmri_emb):
+        """
+        Input: fmri_emb [B, 200, 768]
+        Output:
+            lowlevel_l1: [B, 4, 28, 28] - VAE latent (for L1 loss with vae.encode(image))
+            lowlevel_aux: [B, 49, 512] - ConvNext features (for contrastive loss)
+        """
+        B = fmri_emb.size(0)
+        x = fmri_emb.view(B, -1)  # [B, 153600]
 
-        # cosine similarity(normalized dot product)
-        logits_q2i = scale * (query_emb @ image_emb.t())  # [B, B]
-        logits_i2q = scale * (image_emb @ query_emb.t())  # [B, B]
+        # linear -> dropout -> reshape -> groupnorm
+        lowlevel = self.blin1(x)  # [B, 64*7*7]
+        lowlevel = self.bdropout(lowlevel)
+        lowlevel = lowlevel.reshape(B, 64, 7, 7).contiguous()  # [B, 64, 7, 7]
+        lowlevel = self.bnorm(lowlevel)
 
-        # 정답 index: 주 대각선이 정답이라 각 행의 열을 0,1,2,...,B-1로 설정
-        target = torch.arange(B, device=query_emb.device) # [0,1,2,...,B-1]
-        # ce loss: 주 대각선이 분자이고 나머지가 분모
-        loss = 0.5 * (self.ce(logits_q2i, target) + self.ce(logits_i2q, target)) # scalar
-        return loss
+        # L1 loss용: VAE latent space로 upsampling
+        lowlevel_l1 = self.bupsampler(lowlevel)  # [B, 4, 28, 28]
+
+        # ConvNext loss용: feature projection
+        lowlevel_aux = self.b_maps_projector(lowlevel)  # [B, 512, 7, 7]
+        lowlevel_aux = lowlevel_aux.flatten(2).permute(0, 2, 1)  # [B, 49, 512]
+
+        return lowlevel_l1, lowlevel_aux
 
 
-class Blip2FIMLoss(nn.Module):
+# ============================================================================
+# Output Projection (Linear layer + L2 norm)
+# ============================================================================
+
+class OutputProjection(nn.Module):
     """
-        FIM(Fused-CLS Matching) = BCEWithLogitsLoss 
-        - 입력:
-            logits: [2B]
-            labels: [2B] (0/1)
-        - 출력:
-            loss (scalar)
+    Q-Former 출력을 CLIP space로 projection (Transpose 방식)
+
+    그림 설명:
+        Q-Former output [B, 201, 768]
+        -> Transpose -> [B, 768, 201]
+        -> Linear(201, 257) -> [B, 768, 257]
+        -> Transpose -> [B, 257, 768]
+        -> L2 norm -> [B, 257, 768]
+
+    파라미터 수: 201 * 257 = 51,657 (Flatten 방식 대비 ~600,000배 적음)
     """
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, input_tokens=201, output_tokens=257, hidden_size=768):
         super().__init__()
-        self.reduction = reduction
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.hidden_size = hidden_size
 
-    def forward(self, logits, labels) -> torch.Tensor:
-        logits = logits.view(-1)
-        labels = labels.view(-1).to(dtype=logits.dtype)
+        # [B, 768, 201] -> [B, 768, 257] (각 dimension별 독립 projection)
+        self.proj = nn.Linear(input_tokens, output_tokens)
 
-        # scalar
-        return F.binary_cross_entropy_with_logits(logits, labels, reduction=self.reduction) 
-    
+    def forward(self, x):
+        """
+        Input: x [B, 201, 768]
+        Output: x [B, 257, 768] (L2 normalized)
+        """
+        x = x.transpose(1, 2)  # [B, 768, 201]
+        x = self.proj(x)       # [B, 768, 257]
+        x = x.transpose(1, 2)  # [B, 257, 768]
+        x = F.normalize(x, dim=-1)  # L2 norm
+        return x
+
+
+# ============================================================================
+# Loss Functions
+# ============================================================================
+
+class FIRLoss(nn.Module):
+    """
+    FIR Loss (fMRI-Image Reconstruction): fMRI embedding vs CLIP embedding
+
+    그림 설명:
+        Linear layer [B, 257, 768] <------ FIR Loss ------> Linear layer [B, 257, 768]
+        (from Q-Former)                                     (from CLIP)
+
+    L1 Loss 사용: MSE보다 gradient가 안정적 (큰 오차에서도 gradient가 일정)
+    """
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, fmri_emb, clip_emb):
+        """
+        Input:
+            fmri_emb [B, 257, 768] - Q-Former output (L2 normalized)
+            clip_emb [B, 257, 768] - CLIP output (L2 normalized)
+        Output: scalar loss
+        """
+        return self.l1(fmri_emb, clip_emb)
+
+
+class CrossEntropyLoss(nn.Module):
+    """FIM Loss: BCE (matching)"""
+    def forward(self, logits, labels):
+        return F.binary_cross_entropy_with_logits(logits.view(-1), labels.view(-1).float())
+
+
+# ============================================================================
+# Complete Model
+# ============================================================================
+
+class ConnecToMind2(nn.Module):
+    """
+    ConnecToMind2 - Model2 (New Architecture)
+
+    Architecture:
+        fMRI [B, 200, input_dim]
+            -> (a) Region-level embedding -> [B, 200, 768]
+            -> (b) Connectome-Q-Former -> [B, 201, 768]
+            -> Linear layer -> [B, 257, 768]
+            -> L2 norm -> [B, 257, 768]
+
+        Image [B, 3, 224, 224]
+            -> CLIP ViT-L/14 -> [B, 257, 1024]
+            -> Linear layer + L2 norm -> [B, 257, 768]
+
+    Loss = FIR Loss (fMRI embedding vs CLIP embedding, MSE)
+         + Cross Entropy Loss (CLS token contrastive)
+         + Low-level Loss (VAE L1 + ConvNext Contrastive)
+
+    Output (training):
+        fmri_proj: [B, 257, 768] - Q-Former output (Linear + L2 norm)
+        clip_proj: [B, 257, 768] - CLIP output (Linear + L2 norm)
+        fmri_cls: [B, 768] - fMRI CLS token
+        clip_cls: [B, 768] - CLIP CLS token
+        lowlevel_l1: [B, 4, 28, 28] - VAE latent (for L1 loss)
+        lowlevel_aux: [B, 49, 512] - ConvNext features (for contrastive loss)
+        loss_fir: FIR loss
+        loss_cls: Cross entropy loss
+
+    Versatile Diffusion inputs:
+        - image_embeds: fmri_proj [B, 257, 768]
+        - image: VAE decode(lowlevel_l1) for image condition
+    """
+    def __init__(self, seq_len=200, input_dim=2056, embed_dim=768,
+                 num_qformer_layers=12, num_query_tokens=201):
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.embed_dim = embed_dim
+        self.num_query_tokens = num_query_tokens
+
+        # 1. CLIP Image Encoder (ViT-L/14, frozen)
+        self.clip_encoder = CLIPImageEncoder(freeze=True)
+
+        # 2. Region-level Embedding
+        self.region_embedding = RegionLevelEmbedding(
+            seq_len=seq_len,
+            input_dim=input_dim,
+            embed_dim=embed_dim
+        )
+
+        # 3. Connectome-Q-Former (initialized from CLIP)
+        self.connectome_qformer = ConnectomeQFormer(
+            hidden_size=embed_dim,
+            num_heads=12,
+            num_layers=num_qformer_layers,
+            num_query_tokens=num_query_tokens,
+            dropout=0.1
+        )
+
+        # 4. Output Projection: [B, 201, 768] -> [B, 257, 768]
+        self.output_proj = OutputProjection(
+            input_tokens=num_query_tokens,
+            output_tokens=257,
+            hidden_size=embed_dim
+        )
+
+        # 5. Low-Level Decoder
+        self.low_level_decoder = LowLevelDecoder(seq_len=seq_len, embed_dim=embed_dim)
+
+        # 6. FIM classifier: CLS token [768] -> logit [1]
+        self.fim_classifier = nn.Linear(embed_dim, 1)
+
+        # 7. Loss functions
+        self.fir_loss_fn = FIRLoss()
+        self.fim_loss_fn = CrossEntropyLoss()  # BCE loss
+
+    def forward(self, fmri, images, device):
+        """
+        Training forward (Q-Former 2번 호출: FIR용 마스크 O, FIM용 마스크 X)
+
+        FIR: Q-T 상호 차단 마스크 사용 (Query가 CLIP을 직접 보면 cheating)
+        FIM: 마스크 없음 (Query가 CLIP을 보고 matching 판단)
+
+        Input:
+            fmri [B, 200, input_dim]
+            images [B, 3, 224, 224]
+            device: torch device
+
+        Output: dict
+            fmri_proj: [B, 257, 768] - for FIR loss
+            clip_proj: [B, 257, 768] - for FIR loss
+            lowlevel_l1: [B, 4, 28, 28] - for L1 loss with vae.encode(image)
+            lowlevel_aux: [B, 49, 512] - for soft_cont_loss with ConvNext
+            loss_fir: scalar
+            loss_fim: scalar
+        """
+        B = fmri.size(0)
+
+        # === Image path (CLIP) ===
+        clip_proj = self.clip_encoder(images)  # [B, 257, 768]
+
+        # === fMRI path ===
+        # (a) Region-level embedding
+        fmri_emb = self.region_embedding(fmri)  # [B, 200, 768]
+
+        # === FIR Branch (마스크 O: Q-T 상호 차단) ===
+        qformer_out_fir = self.connectome_qformer(fmri_emb, clip_proj, use_mask=True)  # [B, 201, 768]
+        fmri_proj = self.output_proj(qformer_out_fir)  # [B, 257, 768]
+
+        # === FIM Branch (마스크 X: 전범위 허용) ===
+        perm = torch.randperm(B, device=device)
+        fmri_emb_2b = torch.cat([fmri_emb, fmri_emb], dim=0)  # [2B, 200, 768]
+        clip_proj_2b = torch.cat([clip_proj, clip_proj[perm]], dim=0)  # [2B, 257, 768]
+        fim_labels = torch.cat([torch.ones(B, device=device), torch.zeros(B, device=device)])  # [2B]
+
+        qformer_out_fim = self.connectome_qformer(fmri_emb_2b, clip_proj_2b, use_mask=False)  # [2B, 201, 768]
+
+        # Low-level decoder (원본 fmri_emb만 사용)
+        lowlevel_l1, lowlevel_aux = self.low_level_decoder(fmri_emb)  # [B, 4, 28, 28], [B, 49, 512]
+
+        # === Compute FIR loss ===
+        loss_fir = self.fir_loss_fn(fmri_proj, clip_proj)
+
+        # === FIM Loss ===
+        query_cls_2b = qformer_out_fim[:, 0, :]  # [2B, 768]
+        fim_logits = self.fim_classifier(query_cls_2b).squeeze(-1)  # [2B]
+        loss_fim = self.fim_loss_fn(fim_logits, fim_labels)
+
+        return {
+            "fmri_proj": fmri_proj,          # [B, 257, 768]
+            "clip_proj": clip_proj,          # [B, 257, 768]
+            "lowlevel_l1": lowlevel_l1,      # [B, 4, 28, 28]
+            "lowlevel_aux": lowlevel_aux,    # [B, 49, 512]
+            "loss_fir": loss_fir,
+            "loss_fim": loss_fim,
+        }
+
+    def inference(self, fmri):
+        """
+        Inference (이미지 없이)
+
+        Input: fmri [B, 200, input_dim]
+        Output:
+            fmri_proj: [B, 257, 768] - Versatile Diffusion의 image_embeds로 사용
+            lowlevel_l1: [B, 4, 28, 28] - VAE decode하면 blurry image
+        """
+        # (a) Region-level embedding
+        fmri_emb = self.region_embedding(fmri)  # [B, 200, 768]
+
+        # (b) Connectome-Q-Former
+        qformer_out = self.connectome_qformer(fmri_emb)  # [B, 257, 768]
+
+        # Linear layer + L2 norm
+        fmri_proj = self.output_proj(qformer_out)  # [B, 257, 768]
+
+        # Low-level decoder
+        lowlevel_l1, _ = self.low_level_decoder(fmri_emb)  # [B, 4, 28, 28]
+
+        return {
+            "fmri_proj": fmri_proj,      # [B, 257, 768]
+            "lowlevel_l1": lowlevel_l1,  # [B, 4, 28, 28]
+        }
+
+
+# ============================================================================
+# Model Factory
+# ============================================================================
 
 def get_model(args):
-    #### 학습하는 모델을 담을 객체 ####
-    connectimind2 = ConnecToMind2()
+    """
+    모델 생성
 
-    #### Connectome-Transformer ####
-    connectimind2.connectome_transformer = ConnectomeTransformer()
+    args 필요 속성:
+        - seq_len, input_dim, embed_dim, num_qformer_layers, num_query_tokens
+        - cache_dir: pretrained model cache 경로
 
-    #### fMRI-Image Aligner (FIC + FIM) ####
-    connectimind2.q_former = FMRIImageAligner(
-        num_query_tokens=257,
-        hidden_size=1280,
-        num_heads=16,
-        num_layers=32,
-        cross_attention_freq=2,
-        intermediate_size=5120,
-        dropout=0.1,
-        layer_norm_eps=1e-12,
+    returns:
+        connectomind2: 메인 모델
+        versatile_diffusion: Versatile Diffusion pipeline
+        vae: VAE encoder (for L1 loss)
+        cnx: ConvNext XL (for contrastive loss)
+        l1: L1 loss function
+    """
+    # 캐시 경로 (로컬 우선, 없으면 온라인에서 다운로드)
+    cache_dir = args.cache_dir
+
+    # 메인 모델
+    connectomind2 = ConnecToMind2(
+        seq_len=args.seq_len,
+        input_dim=args.input_dim,
+        embed_dim=args.embed_dim,
+        num_qformer_layers=args.num_qformer_layers,
+        num_query_tokens=args.num_query_tokens,
     )
 
-    #### StableUnCLIP pipeline (SDXL v2.1) 추가 ####
-    unclip_pipeline = StableUnCLIPImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-2-1-unclip",torch_dtype=torch.float16)
+    # High-level reconstruction 용도 -> Versatile Diffusion pipeline
+    # 로컬에 있으면 로컬에서, 없으면 온라인에서 다운로드 후 cache_dir에 저장
+    print("Loading Versatile Diffusion pipeline...")
+    try:
+        versatile_diffusion = DiffusionPipeline.from_pretrained(
+            "shi-labs/versatile-diffusion",
+            torch_dtype=torch.float16,
+            cache_dir=cache_dir,
+            local_files_only=True  # 로컬 우선 시도
+        )
+        print("✅ Versatile Diffusion loaded (from local cache)")
+    except Exception:
+        print("  로컬 캐시 없음, 온라인에서 다운로드...")
+        try:
+            versatile_diffusion = DiffusionPipeline.from_pretrained(
+                "shi-labs/versatile-diffusion",
+                torch_dtype=torch.float16,
+                cache_dir=cache_dir
+            )
+            print("✅ Versatile Diffusion downloaded and cached")
+        except Exception as e:
+            print(f"[!] Versatile Diffusion 로딩 실패: {e}")
+            versatile_diffusion = None
 
-    models = {
-        "connectimind2": connectimind2,
-        "unclip_pipeline": unclip_pipeline,
+    # Low-level reconstruction 용도 -> VAE (for L1 loss - low-level)
+    print("Loading VAE...")
+    try:
+        sd_pipe = DiffusionPipeline.from_pretrained(
+            "lambdalabs/sd-image-variations-diffusers",
+            cache_dir=cache_dir,
+            local_files_only=True  # 로컬 우선 시도
+        )
+        print("✅ VAE loaded (from local cache)")
+    except Exception:
+        print("  로컬 캐시 없음, 온라인에서 다운로드...")
+        sd_pipe = DiffusionPipeline.from_pretrained(
+            "lambdalabs/sd-image-variations-diffusers",
+            cache_dir=cache_dir
+        )
+        print("✅ VAE downloaded and cached")
+    vae = sd_pipe.vae
+    vae.eval().requires_grad_(False)
+
+    # ConvNext XL (for contrastive loss - low-level)
+    print("Loading ConvNext XL...")
+    cnx_path = os.path.join(cache_dir, "convnext_xlarge_alpha0.75_fullckpt.pth")
+    cnx = ConvnextXL(cnx_path)
+    cnx.requires_grad_(False)
+    cnx.eval()
+    print("✅ ConvNext XL loaded")
+
+    # L1 loss
+    l1 = nn.L1Loss()
+
+    return {
+        "connectomind2": connectomind2,
+        "versatile_diffusion": versatile_diffusion,
+        "vae": vae,
+        "cnx": cnx,
+        "l1": l1,
     }
-
-    return models
-                                                  

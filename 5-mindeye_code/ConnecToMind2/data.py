@@ -19,50 +19,52 @@ import nibabel as nib
 import utils
 
 class TrainDataset_ourdata(Dataset): # ses단위로 실행
-    def __init__(self, fmri_path, image_path, transform):
-        self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['X']
-        self.cocoid = self.data['Y']
+    def __init__(self, fmri_path, stimuli_path, image_path, transform):
+        # .npy 파일은 mmap 지원 → 메모리에 전체 로드 없이 필요한 샘플만 읽음
+        self.fmri = np.load(fmri_path, mmap_mode='r')  # [N, 100, 3291]
+        # stimuli: 이미지 파일명 배열 (예: ['coco2017_14.jpg', 'coco2017_28.jpg', ...])
+        self.stimuli = np.load(stimuli_path, allow_pickle=True)  # [N,]
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
 
     def __len__(self):
-        return len(self.cocoid)
+        return len(self.stimuli)
 
-    def __getitem__(self, idx): 
-        # fMRI 데이터 로딩
+    def __getitem__(self, idx):
+        # fMRI 데이터 로딩: [100, 3291]
         fmri_vol = torch.tensor(self.fmri[idx], dtype=torch.float32)
 
         # 이미지 로딩
-        image_path = os.path.join(self.image_path, self.cocoid[idx])
-        image = Image.open(image_path).convert('RGB')
+        img_path = os.path.join(self.image_path, self.stimuli[idx])
+        image = Image.open(img_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
         return fmri_vol, image
 
 class TestDataset_ourdata(Dataset): # ses단위로 실행
-    def __init__(self, fmri_path, image_path, transform):
-        self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['X']
-        self.cocoid = self.data['Y']
+    def __init__(self, fmri_path, stimuli_path, image_path, transform):
+        # .npy 파일은 mmap 지원 → 메모리에 전체 로드 없이 필요한 샘플만 읽음
+        self.fmri = np.load(fmri_path, mmap_mode='r')  # [N, 100, 3291]
+        # stimuli: 이미지 파일명 배열 (예: ['coco2017_14.jpg', 'coco2017_28.jpg', ...])
+        self.stimuli = np.load(stimuli_path, allow_pickle=True)  # [N,]
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
 
     def __len__(self):
-        return len(self.cocoid)
+        return len(self.stimuli)
 
-    def __getitem__(self, idx): 
-        # fMRI 데이터 로딩
+    def __getitem__(self, idx):
+        # fMRI 데이터 로딩: [100, 3291]
         fmri_vol = torch.tensor(self.fmri[idx], dtype=torch.float32)
 
         # 이미지 로딩
-        image_path = os.path.join(self.image_path, self.cocoid[idx])
-        image = Image.open(image_path).convert('RGB')
+        img_path = os.path.join(self.image_path, self.stimuli[idx])
+        image = Image.open(img_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
 
-        return fmri_vol, image, self.cocoid[idx]
+        return fmri_vol, image, self.stimuli[idx]
     
 
 def train_dataset(args):
@@ -75,14 +77,16 @@ def train_dataset(args):
 
     datasets = []
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_fmri_with_labels_train.npz"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_train_schaefer100_T.npy"
+        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli_train_schaefer100_T.npy"
         image_path = f"{root_dir}/{image_dir}"
-        datasets.append(TrainDataset_ourdata(fmri_path, image_path, transform))
+        datasets.append(TrainDataset_ourdata(fmri_path, stimuli_path, image_path, transform))
 
     train_dataset = ConcatDataset(datasets)
     return train_dataset
 
 def test_dataset(args):
+    """Subject별로 분리된 test dataset dictionary 반환"""
     root_dir = args.root_dir
     fmri_dir = args.fmri_dir
     fmri_detail_dir = args.fmri_detail_dir
@@ -90,21 +94,21 @@ def test_dataset(args):
     subjects = args.subjects
     transform = transforms.ToTensor()
 
-    datasets = []
+    datasets = {}
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_fmri_with_labels_test.npz"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_schaefer100_T.npy"
+        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli_test_schaefer100_T.npy"
         image_path = f"{root_dir}/{image_dir}"
-        datasets.append(TestDataset_ourdata(fmri_path, image_path, transform))
+        datasets[sub] = TestDataset_ourdata(fmri_path, stimuli_path, image_path, transform)
 
-    test_dataset = ConcatDataset(datasets)
-    return test_dataset
+    return datasets
 
 def get_dataloader(args):
     '''
-        train_loader.shape 
+        train_loader.shape
             fmri_vol.shape  [batch_size, roir개수, (voxel개수+padding)],
             image.shape  [batch_size, 3, 224, 224]
-        test_loader.shape  
+        test_loaders: dict[subject, DataLoader]
             fmri_vol.shape  [inference_batch_size, roir개수, (voxel개수+padding)],
             image.shape  [inference_batch_size, 3, 224, 224]
             image_id.shape  [inference_batch_size,]  ex) ['coco2017_14.jpg' 'coco2017_14.jpg', ...]
@@ -112,20 +116,20 @@ def get_dataloader(args):
     # 제거할 index 집합
     # drop_idx = {0, 5, 8, 10, 15, 18} # low
     # drop_idx = {1,4,11,14} # high
- 
+
     if args.mode == 'train':
-        train_dataset = train_dataset(args)
-        # keep_idx = [i for i in range(train_dataset.seq_len) if i not in drop_idx]
-        # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_train(keep_idx))
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
+        train_ds = train_dataset(args)
+        # keep_idx = [i for i in range(train_ds.seq_len) if i not in drop_idx]
+        # train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_train(keep_idx))
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
         return train_loader
-    
+
     if args.mode == 'inference':
-        test_dataset = test_dataset(args)
-        # keep_idx = [i for i in range(test_dataset.seq_len) if i not in drop_idx]
-        # test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=args.is_shuffle, worker_init_fn=worker_init_fn, collate_fn=collate_fn_factory_test(keep_idx))
-        test_loader = DataLoader(test_dataset, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=False)
-        return test_loader
+        test_datasets = test_dataset(args)
+        test_loaders = {}
+        for sub, ds in test_datasets.items():
+            test_loaders[sub] = DataLoader(ds, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=False)
+        return test_loaders
     
 def worker_init_fn(worker_id):
     seed = torch.initial_seed() % 2**32  # worker별 고유 seed 생성

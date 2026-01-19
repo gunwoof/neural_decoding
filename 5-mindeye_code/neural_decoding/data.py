@@ -128,8 +128,8 @@ class TestDataset(Dataset): # sub단위로 실행
 class hug_TrainDataset(Dataset): # ses단위로 실행
     def __init__(self, fmri_path, image_path, transform):
         self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['X']
-        self.cocoid = self.data['Y']
+        self.fmri = self.data['beta']
+        self.cocoid = self.data['stimuli']
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
        
@@ -152,8 +152,8 @@ class hug_TrainDataset(Dataset): # ses단위로 실행
 class hug_TestDataset(Dataset): # ses단위로 실행
     def __init__(self, fmri_path, image_path, low_image_path, transform, use_low_image):
         self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['X']
-        self.cocoid = self.data['Y']
+        self.fmri = self.data['beta']
+        self.cocoid = self.data['stimuli']
         self.image_path = image_path
         self.low_image_path = low_image_path
         self.transform = transform # PIL.Image -> tensor
@@ -417,7 +417,7 @@ def sub1_train_dataset_hug(args):
     image_dir = args.image_dir
     transform = transforms.ToTensor()
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_train.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_train_nsdgeneral.npz"
     image_path = f"{root_dir}/{image_dir}"
  
     train_dataset = hug_TrainDataset(fmri_path, image_path, transform)
@@ -434,9 +434,9 @@ def sub1_test_dataset_hug(args):
     transform = transforms.ToTensor()
     use_low_image = args.use_low_image
     
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_fmri_with_labels_test.npz"
+    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_test_nsdgeneral.npz"
     image_path = f"{root_dir}/{image_dir}"
-    low_image_path = f"{root_dir}/{code_dir}/{output_dir}/low_recons_test"
+    low_image_path = f"{root_dir}/{code_dir}/{output_dir}/mindeye1_metric_ourdata/low_recons_test"
  
     test_dataset = hug_TestDataset(fmri_path, image_path, low_image_path, transform, use_low_image)
     

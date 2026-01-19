@@ -33,3 +33,5 @@ python neural_decoding/main.py --device "cuda:3" --is_fc --is_position --fmri_de
 
 mindeye1: python neural_decoding/main.py --device "cuda:3" --fmri_detail_dir "beta_huggingface" --experiment_name "mindeye_test" --batch_size 150 --inference_batch_size 25 --prefetch_factor 10 --num_workers 30
 mindeye1 low: python neural_decoding/main.py --device "cuda:3" --fmri_detail_dir "beta_huggingface" --experiment_name "mindeye_test" --batch_size 100 --inference_batch_size 20 --prefetch_factor 10 --num_workers 30 --no-use_low_image
+
+mindeye1_mni(data에서 key만 바꿔줌, voxel개수): python 5-mindeye_code/neural_decoding/main.py --device "cuda:2" --fmri_detail_dir "beta_mni" --experiment_name "mindeye_test_mni" --batch_size 140 --inference_batch_size 25 --prefetch_factor 10 --num_workers 30 --num_epochs 280

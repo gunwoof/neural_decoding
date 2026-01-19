@@ -757,7 +757,8 @@ def get_model_lowlevel(args):
 def get_model_highlevel(args):
 
     if args.subj == 1:
-        num_voxels = 15724
+        # num_voxels = 15724
+        num_voxels = 101319
     elif args.subj == 2:
         num_voxels = 14278
     elif args.subj == 3:

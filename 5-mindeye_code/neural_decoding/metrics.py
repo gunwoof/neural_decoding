@@ -47,42 +47,104 @@ def alexnet_5(args, recons, gts, alex_model, preprocess, layer='features.11'):
 def inception(args, recons, gts, incep_model, preprocess):
     return two_way_identification(args, recons, gts, incep_model, preprocess, 'avgpool')
 
-# EfficientNet
+# # EfficientNet
+# def efficientnet(args, recons, gts, model, preprocess):
+#     with torch.no_grad():
+#         gt = model(torch.stack([preprocess(g) for g in gts]).to(args.device))['avgpool']
+#         gt = gt.reshape(len(gt), -1).cpu().numpy()
+#         fake = model(torch.stack([preprocess(r) for r in recons]).to(args.device))['avgpool']
+#         fake = fake.reshape(len(fake), -1).cpu().numpy()
+#         return np.array([sp.spatial.distance.correlation(gt[i], fake[i]) for i in range(len(gt))]).mean()
+
+# # SwAV 
+# def swav_metric(args, recons, gts, model, preprocess):
+#     with torch.no_grad():
+#         gt = model(torch.stack([preprocess(g) for g in gts]).to(args.device))['avgpool']
+#         gt = gt.reshape(len(gt), -1).cpu().numpy()
+#         fake = model(torch.stack([preprocess(r) for r in recons]).to(args.device))['avgpool']
+#         fake = fake.reshape(len(fake), -1).cpu().numpy()
+#         return np.array([sp.spatial.distance.correlation(gt[i], fake[i]) for i in range(len(gt))]).mean()
+
+# # 2-way Identification (used for CLIP, AlexNet, Inception)
+# @torch.no_grad()
+# def two_way_identification(args, recons, gts, model, preprocess, feature_layer=None):
+#     device = args.device
+
+#     # (PIL or Tensor) + preprocess
+#     recon_images = [process_image(r, preprocess) for r in recons]
+#     gt_images    = [process_image(g, preprocess) for g in gts]
+
+#     pred_feats = model(torch.stack(recon_images).to(device))
+#     gt_feats = model(torch.stack(gt_images).to(device))
+
+#     if feature_layer:
+#         pred_feats = pred_feats[feature_layer].flatten(1).detach().cpu().numpy()
+#         gt_feats = gt_feats[feature_layer].flatten(1).detach().cpu().numpy()
+#     else:
+#         pred_feats = pred_feats.float().flatten(1).detach().cpu().numpy()
+#         gt_feats = gt_feats.float().flatten(1).detach().cpu().numpy()
+
+#     r = np.corrcoef(gt_feats, pred_feats)
+#     r = r[:len(gt_feats), len(gt_feats):]
+#     correct = (r < np.expand_dims(np.diag(r), axis=1)).sum(axis=1)
+#     return np.mean(correct) / (len(gt_feats) - 1)
+
+# EfficientNet (batch processing)
 def efficientnet(args, recons, gts, model, preprocess):
+    batch_size = 32
     with torch.no_grad():
-        gt = model(torch.stack([preprocess(g) for g in gts]).to(args.device))['avgpool']
-        gt = gt.reshape(len(gt), -1).cpu().numpy()
-        fake = model(torch.stack([preprocess(r) for r in recons]).to(args.device))['avgpool']
-        fake = fake.reshape(len(fake), -1).cpu().numpy()
+        gt_list, fake_list = [], []
+        for i in range(0, len(gts), batch_size):
+            batch_gt = torch.stack([preprocess(g) for g in gts[i:i+batch_size]]).to(args.device)
+            gt_list.append(model(batch_gt)['avgpool'].cpu())
+            batch_fake = torch.stack([preprocess(r) for r in recons[i:i+batch_size]]).to(args.device)
+            fake_list.append(model(batch_fake)['avgpool'].cpu())
+        gt = torch.cat(gt_list).reshape(len(gts), -1).numpy()
+        fake = torch.cat(fake_list).reshape(len(recons), -1).numpy()
         return np.array([sp.spatial.distance.correlation(gt[i], fake[i]) for i in range(len(gt))]).mean()
 
-# SwAV 
+# SwAV (batch processing)
 def swav_metric(args, recons, gts, model, preprocess):
+    batch_size = 32
     with torch.no_grad():
-        gt = model(torch.stack([preprocess(g) for g in gts]).to(args.device))['avgpool']
-        gt = gt.reshape(len(gt), -1).cpu().numpy()
-        fake = model(torch.stack([preprocess(r) for r in recons]).to(args.device))['avgpool']
-        fake = fake.reshape(len(fake), -1).cpu().numpy()
+        gt_list, fake_list = [], []
+        for i in range(0, len(gts), batch_size):
+            batch_gt = torch.stack([preprocess(g) for g in gts[i:i+batch_size]]).to(args.device)
+            gt_list.append(model(batch_gt)['avgpool'].cpu())
+            batch_fake = torch.stack([preprocess(r) for r in recons[i:i+batch_size]]).to(args.device)
+            fake_list.append(model(batch_fake)['avgpool'].cpu())
+        gt = torch.cat(gt_list).reshape(len(gts), -1).numpy()
+        fake = torch.cat(fake_list).reshape(len(recons), -1).numpy()
         return np.array([sp.spatial.distance.correlation(gt[i], fake[i]) for i in range(len(gt))]).mean()
 
-# 2-way Identification (used for CLIP, AlexNet, Inception)
+# 2-way Identification (used for CLIP, AlexNet, Inception) - batch processing
 @torch.no_grad()
 def two_way_identification(args, recons, gts, model, preprocess, feature_layer=None):
     device = args.device
+    batch_size = 32
 
     # (PIL or Tensor) + preprocess
     recon_images = [process_image(r, preprocess) for r in recons]
     gt_images    = [process_image(g, preprocess) for g in gts]
 
-    pred_feats = model(torch.stack(recon_images).to(device))
-    gt_feats = model(torch.stack(gt_images).to(device))
+    # batch processing for recon
+    pred_feats_list = []
+    for i in range(0, len(recon_images), batch_size):
+        batch = torch.stack(recon_images[i:i+batch_size]).to(device)
+        pred_feats_list.append(model(batch))
+
+    # batch processing for gt
+    gt_feats_list = []
+    for i in range(0, len(gt_images), batch_size):
+        batch = torch.stack(gt_images[i:i+batch_size]).to(device)
+        gt_feats_list.append(model(batch))
 
     if feature_layer:
-        pred_feats = pred_feats[feature_layer].flatten(1).detach().cpu().numpy()
-        gt_feats = gt_feats[feature_layer].flatten(1).detach().cpu().numpy()
+        pred_feats = torch.cat([f[feature_layer] for f in pred_feats_list]).flatten(1).detach().cpu().numpy()
+        gt_feats = torch.cat([f[feature_layer] for f in gt_feats_list]).flatten(1).detach().cpu().numpy()
     else:
-        pred_feats = pred_feats.float().flatten(1).detach().cpu().numpy()
-        gt_feats = gt_feats.float().flatten(1).detach().cpu().numpy()
+        pred_feats = torch.cat(pred_feats_list).float().flatten(1).detach().cpu().numpy()
+        gt_feats = torch.cat(gt_feats_list).float().flatten(1).detach().cpu().numpy()
 
     r = np.corrcoef(gt_feats, pred_feats)
     r = r[:len(gt_feats), len(gt_feats):]

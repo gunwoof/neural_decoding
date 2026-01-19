@@ -11,7 +11,7 @@ def parse_args():
         help="train, inference, evaluate 구분"
     )
     parser.add_argument(
-        "--num_epochs",type=int,default=250, choices=[3,240],
+        "--num_epochs",type=int,default=250, choices=[3,240, 280],
         help="epoch 개수",
     )
     parser.add_argument(
@@ -69,7 +69,7 @@ def parse_args():
     )
     parser.add_argument(
         "--fmri_detail_dir", type=str, default="beta_hf_dk",
-        choices=["b4_roi_zscore","beta_huggingface","beta_hf_dk"],
+        choices=["b4_roi_zscore","beta_huggingface","beta_hf_dk","beta_mni"],
         help="Path to the BIDS fmri_detail."
     )
     parser.add_argument(

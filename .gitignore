@@ -13,5 +13,9 @@ work/
 *.log
 
 output/
+*.error
 
 *.nii.gz
+output/
+cache/
+*.png

@@ -137,19 +137,19 @@ class BrainNetwork(nn.Module):
         # low-level submodule
         lowlevels = (None, None)
 
-        lowlevel = self.blin1(x) # [B, 64*8*8]
+        lowlevel = self.blin1(x) # [B, 64*7*7]
         lowlevel = self.bdropout(lowlevel)
         # lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 8, 8).contiguous() # [B, 64, 8, 8]
-        lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 7, 7).contiguous() # [B, 64, ７, ７]
+        lowlevel = lowlevel.reshape(lowlevel.shape[0], -1, 7, 7).contiguous() # [B, 64, 7, 7]
         lowlevel = self.bnorm(lowlevel) 
 
         # l1 loss에 사용됨 -> 실제 blurry image prediction 값
         lowlevel_l1 = self.bupsampler(lowlevel)
 
         # ConvNext loss에 사용됨
-        lowlevel_aux = self.b_maps_projector(lowlevel).flatten(2).permute(0,2,1) # [B, 64, 512]
+        lowlevel_aux = self.b_maps_projector(lowlevel).flatten(2).permute(0,2,1) # [B, 49, 512]
 
-        lowlevels = (lowlevel_l1, lowlevel_aux) # ([B, 4, 64, 64], [B, 64, 512])
+        lowlevels = (lowlevel_l1, lowlevel_aux) # ([B, 4, 28, 28], [B, 49, 512])
         
         # backbone(Diffusion prior), retrieval(retrieval submodule), lowlevel(low-level submodule)
         return backbone, retrieval, lowlevels
