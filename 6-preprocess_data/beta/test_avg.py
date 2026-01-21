@@ -5,19 +5,11 @@ from pathlib import Path
 # =========================
 # inputs
 # =========================
-npy_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-07/sub-07_beta_test_schaefer100_T.npy")
-tsv_path = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm/sub-07/sub-07_beta_test.tsv")
+SUB = "sub-07"
+base_dir = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm") / SUB
+tsv_path = base_dir / f"{SUB}_beta_test.tsv"
 
-# =========================
-# outputs
-# =========================
-out_tsv_sorted = tsv_path.with_suffix("").as_posix() + "_sorted.tsv"
-out_npy_sorted = npy_path.with_suffix("").as_posix() + "_sorted.npy"
-out_npy_avg    = npy_path.with_suffix("").as_posix() + "_avg.npy"
-
-out_tsv_sorted = Path(out_tsv_sorted)
-out_npy_sorted = Path(out_npy_sorted)
-out_npy_avg    = Path(out_npy_avg)
+schaefer_list = list(range(200, 1001, 100))  # 200,300,...,1000
 
 # =========================
 # helper: parse coco num
@@ -32,7 +24,7 @@ def parse_num(s: str) -> int:
     return int(m.group(1))
 
 # =========================
-# 1) read tsv
+# 1) read tsv -> build stable sort order (no writing)
 # =========================
 lines = [ln.strip() for ln in tsv_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 N = len(lines)
@@ -41,78 +33,62 @@ if N % 3 != 0:
 
 nums = np.array([parse_num(x) for x in lines], dtype=np.int64)
 
-# =========================
-# 2) sort indices by (num asc, then keep stable within same num)
-# =========================
-# stable sort so that within 동일 num의 3개는 기존 상대순서를 유지
-order = np.argsort(nums, kind="stable")
-nums_sorted = nums[order]
-lines_sorted = [lines[i] for i in order]
+order = np.argsort(nums, kind="stable")  # stable: keep relative order within same num
 
-# =========================
-# 3) validate: each num appears exactly 3 times, and becomes consecutive blocks
-# =========================
+nums_sorted = nums[order]
 uniq, counts = np.unique(nums_sorted, return_counts=True)
 bad = uniq[counts != 3]
 if bad.size > 0:
-    raise ValueError(f"These coco nums do NOT appear exactly 3 times: {bad[:20]} ... (showing up to 20)")
+    raise ValueError(f"These coco nums do NOT appear exactly 3 times: {bad[:20]} ...")
 
-
-# write sorted tsv
-out_tsv_sorted.write_text("\n".join(lines_sorted) + "\n", encoding="utf-8")
-print(f"[OK] wrote sorted tsv: {out_tsv_sorted}")
-
-# =========================
-# 4) load npy (memmap to avoid huge RAM)
-# =========================
-beta = np.load(npy_path, mmap_mode="r")  # shape (3000, 200, #vox)
-if beta.shape[0] != N:
-    raise ValueError(f"npy first dim {beta.shape[0]} != tsv lines {N}")
-
-T, P, V = beta.shape  # T=3000, P=200
-print(f"[INFO] beta shape: {beta.shape}")
+T = N
+G = T // 3
+print(f"[INFO] TSV lines={T}, unique groups={G}")
 
 # =========================
-# 5) reorder beta according to sorted order
+# per-schaefer: reorder-on-the-fly -> avg only
 # =========================
-# NOTE: fancy indexing on memmap can still allocate; to be safe, write in chunks.
-beta_sorted_mm = np.lib.format.open_memmap(out_npy_sorted, mode="w+", dtype=beta.dtype, shape=beta.shape)
+def process_schaefer(n: int, chunk_groups: int = 8):
+    """
+    chunk_groups: 한 번에 처리할 'group(=3개)' 개수.
+      예) 8이면 8*3=24 trial씩 한 번에 로드/평균
+    """
+    npy_path = base_dir / f"{SUB}_beta_test_schaefer{n}_T.npy"
+    if not npy_path.exists():
+        print(f"[SKIP] missing: {npy_path}")
+        return
 
-chunk = 64  # 조절 가능 (메모리 상황에 따라)
-for start in range(0, T, chunk):
-    end = min(T, start + chunk)
-    idx = order[start:end]
-    beta_sorted_mm[start:end] = beta[idx]
-del beta_sorted_mm  # flush
-print(f"[OK] wrote sorted npy: {out_npy_sorted}")
+    beta = np.load(npy_path, mmap_mode="r")  # (T, P, V)
+    if beta.shape[0] != T:
+        raise ValueError(f"[schaefer{n}] npy first dim {beta.shape[0]} != tsv lines {T}")
 
-# =========================
-# 6) average each consecutive triplet -> (1000, 200, #vox)
-# =========================
-beta_sorted = np.load(out_npy_sorted, mmap_mode="r")  # now already sorted
-G = T // 3  # 1000
-beta_avg_mm = np.lib.format.open_memmap(out_npy_avg, mode="w+", dtype=np.float32, shape=(G, P, V))
+    _, P, V = beta.shape
+    out_npy_avg = Path(npy_path.with_suffix("").as_posix() + "_avg.npy")
 
-# 평균은 float32로 저장(원하면 beta.dtype로 바꿔도 됨)
-for g in range(G):
-    s = 3 * g
-    # (3, 200, V) -> mean over axis=0 => (200, V)
-    beta_avg_mm[g] = beta_sorted[s:s+3].astype(np.float32).mean(axis=0)
+    print(f"[INFO] schaefer{n}: beta shape={beta.shape} -> avg shape=({G},{P},{V})")
 
-del beta_avg_mm
-print(f"[OK] wrote averaged npy (avg over each 3): {out_npy_avg}")
+    beta_avg_mm = np.lib.format.open_memmap(
+        out_npy_avg, mode="w+", dtype=np.float32, shape=(G, P, V)
+    )
 
-# =========================
-# 7) also write unique tsv (1000 lines) if you want
-# =========================
-# 각 3개 블록의 대표(동일 파일명)만 남긴 tsv
-out_tsv_unique = out_tsv_sorted.with_name(out_tsv_sorted.stem + "_unique.tsv")
-unique_lines = [lines_sorted[3*i] for i in range(G)]
-out_tsv_unique.write_text("\n".join(unique_lines) + "\n", encoding="utf-8")
-print(f"[OK] wrote unique tsv (1000 lines): {out_tsv_unique}")
+    # group 단위로 끊어서 reorder + mean
+    for g0 in range(0, G, chunk_groups):
+        g1 = min(G, g0 + chunk_groups)
 
-# final sanity
-nums_unique = np.array([parse_num(x) for x in unique_lines], dtype=np.int64)
-if not np.all(nums_unique[:-1] <= nums_unique[1:]):
-    raise RuntimeError("Unique TSV is not sorted ascending — unexpected.")
-print("[DONE] All steps completed successfully.")
+        # 이 chunk에 해당하는 원본 trial indices (길이 3*(g1-g0))
+        ord_chunk = order[3*g0 : 3*g1]  # length = 3*(g1-g0)
+
+        # (3*(ng), P, V) 로 가져온 뒤 (ng, 3, P, V)로 reshape
+        block = beta[ord_chunk].astype(np.float32)  # load + cast
+        ng = (g1 - g0)
+        block = block.reshape(ng, 3, P, V).mean(axis=1)  # (ng, P, V)
+
+        beta_avg_mm[g0:g1] = block
+
+    del beta_avg_mm  # flush
+    print(f"[OK] schaefer{n}: wrote avg npy: {out_npy_avg}")
+
+for n in schaefer_list:
+    process_schaefer(n)
+
+print("[DONE] avg-only for schaefer200~1000 (missing ones skipped).")

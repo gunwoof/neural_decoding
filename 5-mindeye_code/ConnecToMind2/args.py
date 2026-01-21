@@ -11,8 +11,8 @@ def parse_args():
         help="train, inference, evaluate 구분"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda:2",
-        help='device'
+        "--device", type=str, default="cuda:6",
+        help='only one gpu device'
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -25,26 +25,30 @@ def parse_args():
         help="epoch 개수"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=80,
+        "--batch_size", type=int, default=35,
         help="Batch size (H100:64, L40:32)"
     )
     parser.add_argument(
-        "--inference_batch_size", type=int, default=50,
+        "--inference_batch_size", type=int, default=42,
         help="Inference batch size (H100:32, L40:16)"
     )
     parser.add_argument(
-        "--metric_batch_size", type=int, default=50,
+        "--metric_batch_size", type=int, default=100,
         help="Metric 계산용 batch size (GPU VRAM에 따라 조절: 24GB=32, 16GB=16)"
     )
 
     ###### DataLoader Settings ######
     parser.add_argument(
-        "--prefetch_factor", type=int, default=5,
+        "--prefetch_factor", type=int, default=10,
         help="prefetch factor for dataloader"
     )
     parser.add_argument(
         "--num_workers", type=int, default=20,
         help="num_workers for dataloader"
+    )
+    parser.add_argument(
+        "--eval_num_workers", type=int, default=5,
+        help="num_workers for evaluation dataloader (smaller to avoid NCCL timeout)"
     )
     parser.add_argument(
         "--val_size", type=int, default=10000,
@@ -53,7 +57,7 @@ def parse_args():
 
     ###### Data Paths ######
     parser.add_argument(
-        "--root_dir", type=str, default="/nas/research/03-Neural_decoding",
+        "--root_dir", type=str, default="/workspace/03-Neural_decoding",
         help="Path to the root directory"
     )
     parser.add_argument(
@@ -92,8 +96,8 @@ def parse_args():
         help="Connectome-q former layer 개수"
     )
     parser.add_argument(
-        "--num_query_tokens", type=int, default=257,
-        help="Q-Former query token 개수 (ViT-L: 257)"
+        "--num_query_tokens", type=int, default=101,
+        help="Q-Former query token 개수 (seq_len + 1 CLS token)"
     )
 
     ###### Functional Connectivity ######
@@ -103,13 +107,13 @@ def parse_args():
     )
     parser.add_argument(
         "--fc_matrix_path", type=str,
-        default="/nas/research/03-Neural_decoding/3-bids/derivatives/raw_rest/sub-01/fc_matrix_wo_high_mean.npy",
+        default="/workspace/03-Neural_decoding/3-bids/derivatives/raw_rest/sub-01/fc_matrix_wo_high_mean.npy",
         help="FC matrix 경로"
     )
 
     ###### Loss Weights ######
     parser.add_argument(
-        "--fir_weight", type=float, default=1.0,
+        "--fir_weight", type=float, default=10,
         help="FIR (fMRI-Image Reconstruction) loss weight"
     )
     parser.add_argument(
@@ -145,7 +149,7 @@ def parse_args():
 
     ###### Cache & Pretrained ######
     parser.add_argument(
-        "--cache_dir", type=str, default='/nas/research/03-Neural_decoding/5-mindeye_code/ConnecToMind2/cache',
+        "--cache_dir", type=str, default='/workspace/03-Neural_decoding/5-mindeye_code/ConnecToMind2/cache',
         help="Pretrained model cache directory"
     )
 

@@ -34,7 +34,7 @@ def cosine_scheduler(optimizer, total_steps, num_warmup_steps=0):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def get_scheduler(args, optimizer, num_train):
+def get_scheduler(args, optimizer, num_train, num_processes=1):
     """
     학습률 스케줄러 선택자
 
@@ -42,12 +42,14 @@ def get_scheduler(args, optimizer, num_train):
         args: arguments containing scheduler settings
         optimizer: optimizer instance
         num_train: number of training samples
+        num_processes: DDP에서 사용하는 GPU 수 (default: 1)
 
     Returns:
         scheduler: learning rate scheduler
     """
-    # total_steps 계산
-    total_steps = int(args.num_epochs * math.ceil(num_train / args.batch_size))
+    # total_steps 계산 (DDP에서는 effective batch size = batch_size × num_processes)
+    effective_batch_size = args.batch_size * num_processes
+    total_steps = int(args.num_epochs * math.ceil(num_train / effective_batch_size))
 
     if args.scheduler_type == 'linear':
         return linear_scheduler(optimizer, total_steps)

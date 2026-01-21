@@ -97,7 +97,7 @@ def test_dataset(args):
     datasets = {}
     for sub in subjects:
         fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_schaefer100_T_avg.npy"
-        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli_test_schaefer100_T.npy"
+        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_sorted_unique.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets[sub] = TestDataset_ourdata(fmri_path, stimuli_path, image_path, transform)
 
@@ -129,15 +129,15 @@ def get_dataloader(args):
             generator=torch.Generator().manual_seed(args.seed)
         )
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=False)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
         return train_loader, val_loader
 
     if args.mode == 'inference':
         test_datasets = test_dataset(args)
         test_loaders = {}
         for sub, ds in test_datasets.items():
-            test_loaders[sub] = DataLoader(ds, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=False, pin_memory=True, shuffle=False)
+            test_loaders[sub] = DataLoader(ds, batch_size=args.inference_batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
         return test_loaders
     
 def worker_init_fn(worker_id):
