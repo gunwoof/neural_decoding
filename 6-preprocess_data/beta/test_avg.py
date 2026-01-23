@@ -5,11 +5,11 @@ from pathlib import Path
 # =========================
 # inputs
 # =========================
-SUB = "sub-07"
+SUB = "sub-05"
 base_dir = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm") / SUB
 tsv_path = base_dir / f"{SUB}_beta_test.tsv"
 
-schaefer_list = list(range(200, 1001, 100))  # 200,300,...,1000
+schaefer_list = list(range(100, 401, 100))  
 
 # =========================
 # helper: parse coco num
@@ -53,19 +53,19 @@ def process_schaefer(n: int, chunk_groups: int = 8):
     chunk_groups: 한 번에 처리할 'group(=3개)' 개수.
       예) 8이면 8*3=24 trial씩 한 번에 로드/평균
     """
-    npy_path = base_dir / f"{SUB}_beta_test_schaefer{n}_T.npy"
+    npy_path = base_dir / f"{SUB}_beta_test_vosdewael{n}_T.npy"
     if not npy_path.exists():
         print(f"[SKIP] missing: {npy_path}")
         return
 
     beta = np.load(npy_path, mmap_mode="r")  # (T, P, V)
     if beta.shape[0] != T:
-        raise ValueError(f"[schaefer{n}] npy first dim {beta.shape[0]} != tsv lines {T}")
+        raise ValueError(f"[vosdewael{n}] npy first dim {beta.shape[0]} != tsv lines {T}")
 
     _, P, V = beta.shape
     out_npy_avg = Path(npy_path.with_suffix("").as_posix() + "_avg.npy")
 
-    print(f"[INFO] schaefer{n}: beta shape={beta.shape} -> avg shape=({G},{P},{V})")
+    print(f"[INFO] vosdewael{n}: beta shape={beta.shape} -> avg shape=({G},{P},{V})")
 
     beta_avg_mm = np.lib.format.open_memmap(
         out_npy_avg, mode="w+", dtype=np.float32, shape=(G, P, V)
@@ -86,9 +86,9 @@ def process_schaefer(n: int, chunk_groups: int = 8):
         beta_avg_mm[g0:g1] = block
 
     del beta_avg_mm  # flush
-    print(f"[OK] schaefer{n}: wrote avg npy: {out_npy_avg}")
+    print(f"[OK] vosdewael{n}: wrote avg npy: {out_npy_avg}")
 
 for n in schaefer_list:
     process_schaefer(n)
 
-print("[DONE] avg-only for schaefer200~1000 (missing ones skipped).")
+print("[DONE] avg-only for vosdewael100~400 (missing ones skipped).")

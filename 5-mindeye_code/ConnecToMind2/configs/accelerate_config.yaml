@@ -14,8 +14,8 @@ compute_environment: LOCAL_MACHINE
 
 # ============ Distributed Training Settings ============
 distributed_type: DEEPSPEED
-num_processes: 6               # 사용할 GPU 개수 (환경에 맞게 조정)
-gpu_ids: "0,1,2,3,4,5"         # 특정 GPU 지정 (문자열 형식)
+num_processes: 4               # 사용할 GPU 개수 (환경에 맞게 조정)
+gpu_ids: "0,1,2,3"         # 특정 GPU 지정 (문자열 형식)
 
 # ============ DeepSpeed Settings ============
 # deepspeed_config_file 사용 시 mixed_precision, zero_stage 등은

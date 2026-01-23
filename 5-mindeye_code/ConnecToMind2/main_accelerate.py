@@ -141,7 +141,6 @@ def main():
         print("  ConnecToMind2 model loaded")
         print("  Versatile Diffusion pipeline loaded")
         print("  VAE loaded")
-        print("  ConvNext XL loaded")
 
     # ============ 7. Optimizer & Scheduler ============
     if accelerator.is_main_process:
@@ -166,13 +165,11 @@ def main():
         models["connectomind2"], optimizer, train_loader, val_loader, lr_scheduler
     )
 
-    # VAE, Versatile Diffusion, ConvNext는 frozen이므로 각 GPU에 복사만
+    # VAE, Versatile Diffusion은 frozen이므로 각 GPU에 복사만
     # (학습되지 않으므로 DDP 불필요)
     models["vae"] = models["vae"].to(accelerator.device)
     if models["versatile_diffusion"] is not None:
         models["versatile_diffusion"] = models["versatile_diffusion"].to(accelerator.device)
-    # NOTE: ConvNext는 현재 비활성화되어 있음
-    # models["cnx"] = models["cnx"].to(accelerator.device)
 
     # Test loaders는 DDP 필요 없음 (evaluation은 main process만 수행)
 

@@ -25,15 +25,15 @@ def parse_args():
         help="epoch 개수"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=35,
+        "--batch_size", type=int, default=47,
         help="Batch size (H100:64, L40:32)"
     )
     parser.add_argument(
-        "--inference_batch_size", type=int, default=42,
-        help="Inference batch size (H100:32, L40:16)"
+        "--inference_batch_size", type=int, default=47,
+        help="train batch size와 동일하게 설정"
     )
     parser.add_argument(
-        "--metric_batch_size", type=int, default=100,
+        "--metric_batch_size", type=int, default=1000,
         help="Metric 계산용 batch size (GPU VRAM에 따라 조절: 24GB=32, 16GB=16)"
     )
 
@@ -43,15 +43,15 @@ def parse_args():
         help="prefetch factor for dataloader"
     )
     parser.add_argument(
-        "--num_workers", type=int, default=20,
+        "--num_workers", type=int, default=10,
         help="num_workers for dataloader"
     )
     parser.add_argument(
-        "--eval_num_workers", type=int, default=5,
+        "--eval_num_workers", type=int, default=10,
         help="num_workers for evaluation dataloader (smaller to avoid NCCL timeout)"
     )
     parser.add_argument(
-        "--val_size", type=int, default=10000,
+        "--val_size", type=int, default=8000,
         help="Validation set size (train에서 분리)"
     )
 
@@ -65,8 +65,8 @@ def parse_args():
         help="Path to fMRI data"
     )
     parser.add_argument(
-        "--fmri_detail_dir", type=str, default="beta_mni_2mm",
-        choices=["beta_mni_2mm"],
+        "--fmri_detail_dir", type=str, default="connectomind2",
+        choices=["connectomind2", "beta_mni_2mm"],
         help="fMRI preprocessing type"
     )
     parser.add_argument(
@@ -96,33 +96,32 @@ def parse_args():
         help="Connectome-q former layer 개수"
     )
     parser.add_argument(
-        "--num_query_tokens", type=int, default=101,
-        help="Q-Former query token 개수 (seq_len + 1 CLS token)"
+        "--num_query_tokens", type=int, default=100,
+        help="Q-Former query token 개수 (seq_len과 동일)"
     )
 
     ###### Functional Connectivity ######
     parser.add_argument(
-        "--is_fc", action=argparse.BooleanOptionalAction, default=False,
+        "--is_fc", action=argparse.BooleanOptionalAction, default=True,
         help="Functional connectivity matrix 사용 유무"
-    )
-    parser.add_argument(
-        "--fc_matrix_path", type=str,
-        default="/workspace/03-Neural_decoding/3-bids/derivatives/raw_rest/sub-01/fc_matrix_wo_high_mean.npy",
-        help="FC matrix 경로"
     )
 
     ###### Loss Weights ######
     parser.add_argument(
-        "--fir_weight", type=float, default=10,
+        "--fir_weight", type=float, default=1.0,
         help="FIR (fMRI-Image Reconstruction) loss weight"
     )
     parser.add_argument(
-        "--fim_weight", type=float, default=0.1,
+        "--ftc_weight", type=float, default=1.0,
+        help="FTC (fMRI-Text Contrastive) loss weight"
+    )
+    parser.add_argument(
+        "--fim_weight", type=float, default=1.0,
         help="FIM (matching) loss weight"
     )
     parser.add_argument(
         "--lowlevel_weight", type=float, default=0.01,
-        help="Low-level loss weight (L1 + 0.1*ConvNext contrastive)"
+        help="Low-level loss weight (L1 with VAE latent)"
     )
 
     ###### Optimizer ######
@@ -177,6 +176,10 @@ def parse_args():
     parser.add_argument(
         "--wandb_log", action=argparse.BooleanOptionalAction, default=True,
         help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--log_grad_every", type=int, default=100,
+        help="Log gradient stats every N steps (0 to disable)"
     )
 
     ###### Inference Settings (Versatile Diffusion) ######

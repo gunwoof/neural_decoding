@@ -241,7 +241,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, sca
     progress_bar = tqdm(enumerate(train_loader), total=len(train_loader),
                         desc=f"Epoch {epoch}", ncols=150)
 
-    for batch_idx, (fmri, image) in progress_bar:
+    for batch_idx, (fmri, image, subject_names) in progress_bar:
         # Global step 계산
         current_step = global_step + batch_idx
 
@@ -251,10 +251,11 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, sca
         # Data -> GPU
         fmri = fmri.to(device, non_blocking=True)      # [B, 200, input_dim]
         image = image.to(device, non_blocking=True)    # [B, 3, 224, 224]
+        # subject_names는 CPU에 유지 (string list)
 
         with autocast():
             # ============ Forward ============
-            outputs = model(fmri, image, device)
+            outputs = model(fmri, image, device, subject_names=subject_names)
 
             # Q-Former losses (FIR + FIM)
             loss_fir = outputs["loss_fir"]
@@ -355,12 +356,13 @@ def validate(args, model, vae, val_loader):
 
     losses = []
 
-    for fmri, image in val_loader:
+    for fmri, image, subject_names in val_loader:
         fmri = fmri.to(device, non_blocking=True)
         image = image.to(device, non_blocking=True)
+        # subject_names는 CPU에 유지 (string list)
 
         # Forward
-        outputs = model(fmri, image, device)
+        outputs = model(fmri, image, device, subject_names=subject_names)
 
         # Q-Former losses
         loss_fir = outputs["loss_fir"]
@@ -425,12 +427,13 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
     progress_bar = tqdm(enumerate(test_loader), total=len(test_loader),
                         desc=f"Evaluation Epoch {epoch} [{subject}]", ncols=120)
 
-    for batch_idx, (fmri, gt_images, image_ids) in progress_bar:
+    for batch_idx, (fmri, gt_images, image_ids, subject_names) in progress_bar:
         # Data -> GPU
         fmri = fmri.to(device)
+        # subject_names는 CPU에 유지 (string list)
 
         # ============ Forward Inference ============
-        outputs = model.inference(fmri)
+        outputs = model.inference(fmri, subject_names=subject_names)
         fmri_proj = outputs["fmri_proj"]      # [B, 257, 768] - conditioning
         lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 28, 28] - VAE latent
 

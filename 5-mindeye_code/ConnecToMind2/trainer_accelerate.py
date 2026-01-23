@@ -26,7 +26,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.nn.functional as F
 
-from utils import soft_cont_loss, img_augment, versatile_diffusion_reconstruct, save_recon_batch, load_recons_from_disk
+from utils import img_augment, versatile_diffusion_reconstruct, save_recon_batch, save_lowlevel_batch, load_recons_from_disk
 
 
 # ============================================================================
@@ -93,8 +93,8 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
 
         # ============ Evaluation + Metric ============
         # Epoch 0 또는 Epoch 250 이상에서 5 단위
-        # should_evaluate = (epoch == 0) or (epoch >= 250 and epoch % 5 == 0)
-        should_evaluate = (epoch >= 250 and epoch % 5 == 0)
+        should_evaluate = (epoch == 0) or (epoch >= 250 and epoch % 5 == 0)
+        # should_evaluate = (epoch >= 250 and epoch % 5 == 0)
 
         if should_evaluate:
             # 모든 프로세스가 평가 시작 전 동기화
@@ -103,8 +103,10 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
             if accelerator.is_main_process:
                 print(f"\n[Epoch {epoch}] Evaluation & Metrics (DDP across {accelerator.num_processes} GPUs)...")
 
-            # 이미지 저장 디렉토리
-            recon_dir = os.path.join(output_dir, f"recons_epoch{epoch}")
+            # 이미지 저장 디렉토리 (새 구조: 실험이름/실험이름_epoch*/recon/, 실험이름/실험이름_epoch*/low_recon/)
+            epoch_dir = os.path.join(output_dir, args.experiment_name, f"{args.experiment_name}_epoch{epoch}")
+            recon_dir = os.path.join(epoch_dir, "recon")
+            low_recon_dir = os.path.join(epoch_dir, "low_recon")
 
             # ============ Step 1: 모든 Subject의 이미지 생성 및 저장 (DDP) ============
             for sub, sub_loader in test_loaders.items():
@@ -112,7 +114,7 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
                     print(f"\n  [{sub}] Generating reconstructions (distributed across {accelerator.num_processes} GPUs)...")
 
                 # 모든 GPU가 함께 evaluate 실행 (각자 다른 batch 처리)
-                num_samples = evaluate(args, model, vae, versatile_diffusion, sub_loader, epoch, sub, recon_dir, accelerator)
+                num_samples = evaluate(args, model, vae, versatile_diffusion, sub_loader, epoch, sub, recon_dir, low_recon_dir, accelerator)
 
                 # 각 GPU가 처리한 샘플 수 합산
                 total_samples = accelerator.gather(torch.tensor(num_samples, device=accelerator.device)).sum().item()
@@ -176,7 +178,8 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
             if accelerator.is_main_process:
                 unwrapped_model = accelerator.unwrap_model(model)
 
-                model_path = os.path.join(output_dir, f"{args.model_name}_epoch{epoch}.pt")
+                # 체크포인트 저장: 실험이름_epoch*.pt
+                model_path = os.path.join(epoch_dir, f"{args.experiment_name}_epoch{epoch}.pt")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': unwrapped_model.state_dict(),
@@ -186,9 +189,10 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
                 }, model_path)
                 print(f"Model saved: {model_path}")
                 print(f"Reconstructions saved: {recon_dir}")
+                print(f"Low-level images saved: {low_recon_dir}")
 
-                # Metric 결과 텍스트 저장
-                metric_path = os.path.join(output_dir, f"metrics_epoch{epoch}.txt")
+                # Metric 결과 텍스트 저장: 실험이름_metric.txt
+                metric_path = os.path.join(epoch_dir, f"{args.experiment_name}_metric.txt")
                 with open(metric_path, "w") as f:
                     f.write(f"Epoch: {epoch}\n")
                     f.write(f"{'='*40}\n")
@@ -245,7 +249,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
     else:
         progress_bar = enumerate(train_loader)
 
-    for batch_idx, (fmri, image) in progress_bar:
+    for batch_idx, (fmri, image, subject_name) in progress_bar:
         # Global step 계산
         current_step = global_step + batch_idx
 
@@ -258,10 +262,11 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 
         # ============ Forward ============
         # Accelerator가 mixed precision 자동 처리
-        outputs = model(fmri, image, device)
+        outputs = model(fmri, image, device, subject_names=subject_name)
 
-        # Q-Former losses (FIR + FIM)
+        # Q-Former losses (FIR + FTC + FIM)
         loss_fir = outputs["loss_fir"]
+        loss_ftc = outputs["loss_ftc"]
         loss_fim = outputs["loss_fim"]
 
         # ============ Low-level L1 Loss ============
@@ -273,11 +278,9 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 
         loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
 
-        # ============ ConvNext Contrastive Loss (비활성화) ============
-        loss_cnx = torch.tensor(0.0, device=device)
-
         # ============ Total Loss ============
         loss = (args.fir_weight * loss_fir
+                + args.ftc_weight * loss_ftc
                 + args.fim_weight * loss_fim
                 + args.lowlevel_weight * (loss_l1/0.18215))
 
@@ -285,6 +288,10 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
         # Accelerator가 scaling + gradient sync 자동 처리
         # DeepSpeed: gradient clipping은 deepspeed_config.json에서 설정 (1.0)
         accelerator.backward(loss)
+
+        # ============ Gradient Logging ============
+        if args.log_grad_every > 0 and current_step % args.log_grad_every == 0:
+            log_gradient_stats(model, current_step, accelerator, wandb_log=args.wandb_log)
 
         # Optimizer step
         optimizer.step()
@@ -304,9 +311,9 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "train/step": current_step,
                 "train/loss": loss.item(),
                 "train/loss_fir": loss_fir.item(),
+                "train/loss_ftc": loss_ftc.item(),
                 "train/loss_fim": loss_fim.item(),
                 "train/loss_l1": loss_l1.item(),
-                "train/loss_cnx": loss_cnx.item(),
                 "train/lr": lrs_log[-1],
             }
 
@@ -314,6 +321,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 progress_bar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     fir=f"{loss_fir.item():.4f}",
+                    ftc=f"{loss_ftc.item():.4f}",
                     fim=f"{loss_fim.item():.4f}",
                     l1=f"{loss_l1.item():.4f}"
                 )
@@ -345,16 +353,17 @@ def validate(args, model, vae, val_loader, accelerator):
     total_loss = 0.0
     total_samples = 0
 
-    for fmri, image in val_loader:
+    for fmri, image, subject_name in val_loader:
         batch_size = fmri.size(0)  # 실제 배치 크기 (마지막 배치는 작을 수 있음)
         fmri = fmri.to(device=device, dtype=torch.bfloat16)
         image = image.to(device=device, dtype=torch.bfloat16)
 
         # Forward
-        outputs = model(fmri, image, device)
+        outputs = model(fmri, image, device, subject_names=subject_name)
 
         # Q-Former losses
         loss_fir = outputs["loss_fir"]
+        loss_ftc = outputs["loss_ftc"]
         loss_fim = outputs["loss_fim"]
 
         # Low-level L1 Loss (VAE는 float32이므로 변환 필요)
@@ -365,6 +374,7 @@ def validate(args, model, vae, val_loader, accelerator):
 
         # Total loss
         loss = (args.fir_weight * loss_fir
+                + args.ftc_weight * loss_ftc
                 + args.fim_weight * loss_fim
                 + args.lowlevel_weight * (loss_l1 / 0.18215))
 
@@ -390,9 +400,13 @@ def validate(args, model, vae, val_loader, accelerator):
 # ============================================================================
 
 @torch.no_grad()
-def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject, save_dir, accelerator):
+def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject, recon_dir, low_recon_dir, accelerator):
     """
     Evaluation: fMRI -> 이미지 reconstruction (DDP로 병렬 처리)
+
+    Args:
+        recon_dir: Versatile Diffusion 결과 저장 디렉토리 (실험이름_epoch*/recon/)
+        low_recon_dir: Low-level (VAE blurry) 결과 저장 디렉토리 (실험이름_epoch*/low_recon/)
 
     주의: 모든 프로세스에서 호출되며, 각 GPU가 다른 batch를 처리
     """
@@ -416,12 +430,12 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
     else:
         progress_bar = enumerate(test_loader)
 
-    for batch_idx, (fmri, gt_images, image_ids) in progress_bar:
+    for batch_idx, (fmri, gt_images, image_ids, subject_name) in progress_bar:
         # Data -> GPU with correct dtype
         fmri = fmri.to(device=device, dtype=torch.bfloat16)
 
         # ============ Forward Inference ============
-        outputs = model_unwrapped.inference(fmri)
+        outputs = model_unwrapped.inference(fmri, subject_names=subject_name)
         fmri_proj = outputs["fmri_proj"]      # [B, 257, 768]
         lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 28, 28]
 
@@ -449,7 +463,11 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         gt_tensors = gt_images
 
         # ============ 배치 단위로 디스크에 저장 ============
-        save_recon_batch(recon_tensors, gt_tensors, image_ids, save_dir, subject)
+        # 1. Versatile Diffusion 결과 (recon/)
+        save_recon_batch(recon_tensors, gt_tensors, image_ids, recon_dir, subject)
+
+        # 2. Low-level (VAE blurry) 결과 (low_recon/)
+        save_lowlevel_batch(blurry_image, gt_tensors, image_ids, low_recon_dir, subject)
 
         num_samples += len(image_ids)
 
@@ -525,3 +543,95 @@ def compute_metrics(args, all_recons, all_targets, metrics):
     )
 
     return results
+
+
+# ============================================================================
+# Gradient Logging
+# ============================================================================
+
+def log_gradient_stats(model, step, accelerator, wandb_log=False):
+    """
+    모든 레이어의 gradient 통계 로깅 (norm, mean, std)
+
+    Args:
+        model: 학습 중인 모델
+        step: 현재 global step
+        accelerator: Accelerate accelerator
+        wandb_log: WandB에 로깅할지 여부
+    """
+    # DDP unwrap
+    model_unwrapped = accelerator.unwrap_model(model)
+
+    grad_stats = {}
+
+    for name, param in model_unwrapped.named_parameters():
+        if param.grad is not None:
+            grad = param.grad.data
+            grad_stats[name] = {
+                'norm': grad.norm(2).item(),
+                'mean': grad.mean().item(),
+                'std': grad.std().item(),
+            }
+
+    # 콘솔 출력 (그룹별 요약)
+    if accelerator.is_main_process:
+        print(f"\n{'='*60}")
+        print(f"[Step {step}] Gradient Statistics")
+        print(f"{'='*60}")
+
+        # 레이어 그룹별 정리
+        groups = {
+            'region_embedding': [],
+            'connectome_qformer.query_tokens': [],
+            'connectome_qformer.blocks': [],
+            'connectome_qformer.final_ln': [],
+            'output_proj': [],
+            'low_level_decoder': [],
+            'fim_classifier': [],
+            'clip_encoder': [],
+            'other': [],
+        }
+
+        for name, stats in grad_stats.items():
+            matched = False
+            for group_name in groups.keys():
+                if group_name in name:
+                    groups[group_name].append((name, stats))
+                    matched = True
+                    break
+            if not matched:
+                groups['other'].append((name, stats))
+
+        # 그룹별 출력
+        for group_name, items in groups.items():
+            if not items:
+                continue
+
+            # 그룹 평균 계산
+            avg_norm = np.mean([s['norm'] for _, s in items])
+            avg_mean = np.mean([s['mean'] for _, s in items])
+            avg_std = np.mean([s['std'] for _, s in items])
+
+            print(f"\n[{group_name}] ({len(items)} params)")
+            print(f"  avg norm={avg_norm:.6f}, mean={avg_mean:.6f}, std={avg_std:.6f}")
+
+            # 문제 감지
+            for name, stats in items:
+                if stats['norm'] < 1e-7:
+                    print(f"  ⚠️  VANISHING: {name} (norm={stats['norm']:.2e})")
+                elif stats['norm'] > 100:
+                    print(f"  ⚠️  EXPLODING: {name} (norm={stats['norm']:.2e})")
+
+        print(f"{'='*60}\n")
+
+        # WandB 로깅 (상세)
+        if wandb_log:
+            wandb_logs = {}
+            for name, stats in grad_stats.items():
+                # 이름 정리 (wandb 경로용)
+                clean_name = name.replace('.', '/')
+                wandb_logs[f"grad/{clean_name}/norm"] = stats['norm']
+                wandb_logs[f"grad/{clean_name}/mean"] = stats['mean']
+                wandb_logs[f"grad/{clean_name}/std"] = stats['std']
+
+            wandb.log(wandb_logs, step=step)

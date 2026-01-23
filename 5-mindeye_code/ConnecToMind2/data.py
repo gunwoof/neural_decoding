@@ -27,6 +27,10 @@ class TrainDataset_ourdata(Dataset): # ses단위로 실행
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
 
+        # 파일 경로에서 subject ID 자동 추출 (예: /path/to/sub-01/... -> "sub-01")
+        match = re.search(r'(sub-\d+)', fmri_path)
+        self.subject_name = match.group(1) if match else "unknown"
+
     def __len__(self):
         return len(self.stimuli)
 
@@ -40,7 +44,7 @@ class TrainDataset_ourdata(Dataset): # ses단위로 실행
         if self.transform:
             image = self.transform(image)
 
-        return fmri_vol, image
+        return fmri_vol, image, self.subject_name
 
 class TestDataset_ourdata(Dataset): # ses단위로 실행
     def __init__(self, fmri_path, stimuli_path, image_path, transform):
@@ -51,6 +55,10 @@ class TestDataset_ourdata(Dataset): # ses단위로 실행
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
 
+        # 파일 경로에서 subject ID 자동 추출 (예: /path/to/sub-01/... -> "sub-01")
+        match = re.search(r'(sub-\d+)', fmri_path)
+        self.subject_name = match.group(1) if match else "unknown"
+
     def __len__(self):
         return len(self.stimuli)
 
@@ -64,7 +72,7 @@ class TestDataset_ourdata(Dataset): # ses단위로 실행
         if self.transform:
             image = self.transform(image)
 
-        return fmri_vol, image, self.stimuli[idx]
+        return fmri_vol, image, self.stimuli[idx], self.subject_name
     
 
 def train_dataset(args):
@@ -77,8 +85,8 @@ def train_dataset(args):
 
     datasets = []
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_train_schaefer100_T.npy"
-        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli_train_schaefer100_T.npy"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-train_schaefer100.npy"
+        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli-train.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets.append(TrainDataset_ourdata(fmri_path, stimuli_path, image_path, transform))
 
@@ -96,8 +104,8 @@ def test_dataset(args):
 
     datasets = {}
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_schaefer100_T_avg.npy"
-        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta_test_sorted_unique.npy"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-test_schaefer100.npy"
+        stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli-test.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets[sub] = TestDataset_ourdata(fmri_path, stimuli_path, image_path, transform)
 
@@ -129,7 +137,7 @@ def get_dataloader(args):
             generator=torch.Generator().manual_seed(args.seed)
         )
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
         return train_loader, val_loader
 

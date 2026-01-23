@@ -20,14 +20,14 @@ def transpose_save_memmap(in_path, out_path, chunk=256):
 
     del y_mm  # flush
 
-for n in range(200, 1001, 100):
+for n in range(100, 401, 100):
     for split in ["train", "test"]:
-        in_path = os.path.join(base_dir, f"{sub}_beta_{split}_schaefer{n}.npy")
+        in_path = os.path.join(base_dir, f"{sub}_beta_{split}_vosdewael{n}.npy")
         if not os.path.exists(in_path):
             print(f"[SKIP] not found: {in_path}")
             continue
 
-        out_path = os.path.join(base_dir, f"{sub}_beta_{split}_schaefer{n}_T.npy")
+        out_path = os.path.join(base_dir, f"{sub}_beta_{split}_vosdewael{n}_T.npy")
         transpose_save_memmap(in_path, out_path, chunk=256)
 
         # shape 확인(헤더만 읽어서 빠름)

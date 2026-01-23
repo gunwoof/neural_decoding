@@ -9,33 +9,9 @@ from torchvision.utils import save_image
 from PIL import Image
 
 
-def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125):
-    """
-    ConvNext feature contrastive loss (MindEye2 원본 방식 - Soft Label KL Divergence)
-
-    Args:
-        student_preds: [B*49, 512] - 모델 예측 features
-        teacher_preds: [B*49, 512] - 원본 이미지 ConvNext features
-        teacher_aug_preds: [B*49, 512] - augmented 이미지 ConvNext features
-        temp: temperature for softmax
-
-    Returns:
-        loss: contrastive loss (soft label 방식으로 안정적)
-    """
-    teacher_teacher_aug = (teacher_preds @ teacher_aug_preds.T) / temp
-    teacher_teacher_aug_t = (teacher_aug_preds @ teacher_preds.T) / temp
-    student_teacher_aug = (student_preds @ teacher_aug_preds.T) / temp
-    student_teacher_aug_t = (teacher_aug_preds @ student_preds.T) / temp
-
-    loss1 = -(student_teacher_aug.log_softmax(-1) * teacher_teacher_aug.softmax(-1)).sum(-1).mean()
-    loss2 = -(student_teacher_aug_t.log_softmax(-1) * teacher_teacher_aug_t.softmax(-1)).sum(-1).mean()
-
-    return (loss1 + loss2) / 2
-
-
 def img_augment(image, num_aug=1):
     """
-    이미지 augmentation (ConvNext loss용)
+    이미지 augmentation
 
     Args:
         image: [B, 3, H, W] tensor
@@ -96,13 +72,14 @@ def save_reconstructions(save_dict, save_dir):
 
 def save_recon_batch(recon_tensors, gt_tensors, image_ids, save_dir, subject):
     """
-    배치 단위로 reconstruction 이미지를 Subject별 디렉토리에 저장
+    배치 단위로 Versatile Diffusion reconstruction 이미지를 Subject별 디렉토리에 저장
+    (recon/ 폴더에 저장)
 
     Args:
         recon_tensors: [B, 3, H, W] reconstruction 이미지 텐서
         gt_tensors: [B, 3, H, W] GT 이미지 텐서
         image_ids: List of image IDs
-        save_dir: 기본 저장 디렉토리
+        save_dir: 기본 저장 디렉토리 (실험이름_epoch*/recon/)
         subject: Subject ID (예: 'sub-01')
     """
     subject_dir = os.path.join(save_dir, subject)
@@ -115,6 +92,31 @@ def save_recon_batch(recon_tensors, gt_tensors, image_ids, save_dir, subject):
         gt_path = os.path.join(subject_dir, f"{base_name}_gt.png")
 
         save_image(recon_tensors[i].clamp(0, 1), recon_path)
+        save_image(gt_tensors[i].clamp(0, 1), gt_path)
+
+
+def save_lowlevel_batch(lowlevel_tensors, gt_tensors, image_ids, save_dir, subject):
+    """
+    배치 단위로 low-level (VAE blurry) 이미지를 Subject별 디렉토리에 저장
+    (low_recon/ 폴더에 저장)
+
+    Args:
+        lowlevel_tensors: [B, 3, H, W] low-level 이미지 텐서 (VAE decoded)
+        gt_tensors: [B, 3, H, W] GT 이미지 텐서
+        image_ids: List of image IDs
+        save_dir: 기본 저장 디렉토리 (실험이름_epoch*/low_recon/)
+        subject: Subject ID (예: 'sub-01')
+    """
+    subject_dir = os.path.join(save_dir, subject)
+    os.makedirs(subject_dir, exist_ok=True)
+
+    for i, img_id in enumerate(image_ids):
+        # 확장자 제거 후 png로 저장
+        base_name = os.path.splitext(img_id)[0]
+        lowlevel_path = os.path.join(subject_dir, f"{base_name}_lowlevel.png")
+        gt_path = os.path.join(subject_dir, f"{base_name}_gt.png")
+
+        save_image(lowlevel_tensors[i].clamp(0, 1), lowlevel_path)
         save_image(gt_tensors[i].clamp(0, 1), gt_path)
 
 
