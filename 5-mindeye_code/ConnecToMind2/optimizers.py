@@ -37,16 +37,16 @@ def get_optimizer_with_different_lr(args, model, backbone_lr_scale=0.1):
             'weight_decay': 0.0,
             'lr': args.max_lr
         },
-        # Connectome-QFormer (lower lr - CLIP initialized)
+        # Connectome-QFormer (lower lr - CLIP initialized, excluding fc_prior_scale)
         {
             'params': [p for n, p in model.connectome_qformer.named_parameters()
-                       if not any(nd in n for nd in no_decay)],
+                       if not any(nd in n for nd in no_decay) and 'fc_prior_scale' not in n],
             'weight_decay': args.weight_decay,
             'lr': args.max_lr * backbone_lr_scale
         },
         {
             'params': [p for n, p in model.connectome_qformer.named_parameters()
-                       if any(nd in n for nd in no_decay)],
+                       if any(nd in n for nd in no_decay) and 'fc_prior_scale' not in n],
             'weight_decay': 0.0,
             'lr': args.max_lr * backbone_lr_scale
         },
@@ -73,6 +73,31 @@ def get_optimizer_with_different_lr(args, model, backbone_lr_scale=0.1):
         {
             'params': [p for n, p in model.low_level_decoder.named_parameters()
                        if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+            'lr': args.max_lr
+        },
+        # FIM Classifier (full lr - randomly initialized)
+        {
+            'params': [p for n, p in model.fim_classifier.named_parameters()
+                       if not any(nd in n for nd in no_decay)],
+            'weight_decay': args.weight_decay,
+            'lr': args.max_lr
+        },
+        {
+            'params': [p for n, p in model.fim_classifier.named_parameters()
+                       if any(nd in n for nd in no_decay)],
+            'weight_decay': 0.0,
+            'lr': args.max_lr
+        },
+        # FTC Loss Temperature (full lr - learnable parameter)
+        {
+            'params': [model.ftc_loss_fn.temp],
+            'weight_decay': 0.0,
+            'lr': args.max_lr
+        },
+        # FC Prior Scale (full lr - learnable parameter)
+        {
+            'params': [model.connectome_qformer.fc_prior_scale],
             'weight_decay': 0.0,
             'lr': args.max_lr
         },

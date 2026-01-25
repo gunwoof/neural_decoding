@@ -38,6 +38,8 @@ Loss = FIR Loss (fMRI embedding vs CLIP embedding, L1)
      + FTC Loss (BLIP-2 ITC style: bidirectional contrastive)
      + FIM Loss (BLIP-2 ITM style: 3B samples with hard negative mining)
      + Low-level Loss (L1 with target image)
+
+Note: Low-level decoder outputs [B, 4, 32, 32] for 256x256 images.
 """
 
 import os
@@ -46,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 
-from transformers import CLIPVisionModel
+from transformers import CLIPVisionModel, CLIPVisionModelWithProjection
 from diffusers import DiffusionPipeline
 from diffusers.models.autoencoder_kl import Decoder
 
@@ -66,31 +68,27 @@ class CLIPImageEncoder(nn.Module):
     """
     def __init__(self, pretrained_model="openai/clip-vit-large-patch14", freeze=True):
         super().__init__()
-        self.clip_model = CLIPVisionModel.from_pretrained(pretrained_model)
+        # Use CLIPVisionModelWithProjection (includes pretrained visual_projection layer)
+        self.clip_model = CLIPVisionModelWithProjection.from_pretrained(pretrained_model)
 
         if freeze:
             for param in self.clip_model.parameters():
                 param.requires_grad = False
 
-        # CLIP ViT-L/14 hidden size: 1024
-        self.clip_hidden_size = 1024
-        self.output_dim = 768
-
-        # Linear layer: [B, 257, 1024] -> [B, 257, 768]
-        self.proj = nn.Linear(self.clip_hidden_size, self.output_dim)
-
     def forward(self, images):
         """
         Input: images [B, 3, 224, 224]
         Output:
-            hidden_state [B, 257, 768] - Linear + L2 norm (for MSE Loss)
-            cls_token [B, 768] - CLS token (for Cross Entropy Loss)
+            hidden_state [B, 257, 768] - Pretrained projection + L2 norm
         """
         outputs = self.clip_model(images, output_hidden_states=True)
         last_hidden = outputs.last_hidden_state  # [B, 257, 1024]
 
-        # Linear layer + L2 norm
-        hidden_state = self.proj(last_hidden)  # [B, 257, 768]
+        # Post layer norm
+        last_hidden = self.clip_model.vision_model.post_layernorm(last_hidden)  # [B, 257, 1024]
+
+        # Pretrained visual projection + L2 norm (MindEye1 style)
+        hidden_state = self.clip_model.visual_projection(last_hidden)  # [B, 257, 768]
         hidden_state = F.normalize(hidden_state, dim=-1)  # L2 norm
 
         return hidden_state
@@ -489,24 +487,38 @@ class LowLevelDecoder(nn.Module):
     input:
         fmri_emb: [B, 100, 768]
     output:
-        lowlevel_l1: [B, 4, 28, 28] - VAE latent space (L1 loss용, 224x224 이미지 기준)
+        lowlevel_l1: [B, 4, 32, 32] - VAE latent space (256x256 이미지 기준)
+
+    Shape 흐름:
+        [B, 100, 768] → 76,800
+            ↓ flatten
+        [B, 76800] → 76,800
+            ↓ Linear (압축률 18.75배)
+        [B, 4096] → 64 × 8 × 8 = 4,096
+            ↓ reshape
+        [B, 64, 8, 8] → 4,096
+            ↓ UpBlock (8→16)
+        [B, 64, 16, 16] → 16,384
+            ↓ UpBlock (16→32, ch: 64→4)
+        [B, 4, 32, 32] → 4,096  ← Versatile Diffusion latent (256x256)
     """
     def __init__(self, seq_len=100, embed_dim=768):
         super().__init__()
 
         self.flatten_dim = seq_len * embed_dim  # 100 * 768 = 76800
 
-        # fmri_emb -> [B, 64, 7, 7] feature map (64*7*7 = 3136)
-        self.blin1 = nn.Linear(self.flatten_dim, 64 * 7 * 7, bias=True)
+        # fmri_emb -> [B, 64, 8, 8] feature map (64*8*8 = 4096, 압축률 18.75배)
+        self.blin1 = nn.Linear(self.flatten_dim, 64 * 8 * 8, bias=True)
         self.bdropout = nn.Dropout(0.3)
         self.bnorm = nn.GroupNorm(1, 64)
 
-        # [B, 64, 7, 7] -> [B, 4, 28, 28] (VAE latent space, 3개 UpBlock으로 4x upsampling)
+        # [B, 64, 8, 8] -> [B, 4, 32, 32] (VAE latent space for 256x256, 2개 UpBlock으로 4x upsampling)
+        # Note: Decoder의 마지막 block은 upsample 안 함, 그래서 block_out_channels는 len(up_block_types)+1 필요
         self.bupsampler = Decoder(
             in_channels=64,
             out_channels=4,
-            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"],
-            block_out_channels=[32, 64, 128],
+            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D"],
+            block_out_channels=[64, 64, 64],  # [32, 64, 128]보다 빠름
             layers_per_block=1,
         )
 
@@ -514,19 +526,19 @@ class LowLevelDecoder(nn.Module):
         """
         Input: fmri_emb [B, 100, 768]
         Output:
-            lowlevel_l1: [B, 4, 28, 28] - VAE latent (for L1 loss with vae.encode(image))
+            lowlevel_l1: [B, 4, 32, 32] - VAE latent (for Versatile Diffusion 256x256)
         """
         B = fmri_emb.size(0)
-        x = fmri_emb.view(B, -1)  # [B, 153600]
+        x = fmri_emb.view(B, -1)  # [B, 76800]
 
         # linear -> dropout -> reshape -> groupnorm
-        lowlevel = self.blin1(x)  # [B, 64*7*7]
+        lowlevel = self.blin1(x)  # [B, 4096]
         lowlevel = self.bdropout(lowlevel)
-        lowlevel = lowlevel.reshape(B, 64, 7, 7).contiguous()  # [B, 64, 7, 7]
+        lowlevel = lowlevel.reshape(B, 64, 8, 8).contiguous()  # [B, 64, 8, 8]
         lowlevel = self.bnorm(lowlevel)
 
-        # L1 loss용: VAE latent space로 upsampling
-        lowlevel_l1 = self.bupsampler(lowlevel)  # [B, 4, 28, 28]
+        # VAE latent space로 upsampling (256x256 기준)
+        lowlevel_l1 = self.bupsampler(lowlevel)  # [B, 4, 32, 32]
 
         return lowlevel_l1
 
@@ -712,17 +724,19 @@ class FIMLoss(nn.Module):
         B = fmri_emb.size(0)
         device = fmri_emb.device
 
-        # Step 1: Mask diagonal (positive pairs) for hard negative mining
-        sim_fmri2clip_neg = sim_fmri2clip.clone()
-        sim_clip2fmri_neg = sim_clip2fmri.clone()
-        sim_fmri2clip_neg.fill_diagonal_(-10000)
-        sim_clip2fmri_neg.fill_diagonal_(-10000)
+        # Step 1: Hard negative mining (BLIP-2 style: within torch.no_grad)
+        with torch.no_grad():
+            # Mask diagonal (positive pairs)
+            sim_fmri2clip_neg = sim_fmri2clip.clone()
+            sim_clip2fmri_neg = sim_clip2fmri.clone()
+            sim_fmri2clip_neg.fill_diagonal_(-10000)
+            sim_clip2fmri_neg.fill_diagonal_(-10000)
 
-        # Step 2: Softmax to get sampling weights
-        weights_fmri2clip = F.softmax(sim_fmri2clip_neg, dim=1)  # [B, B]
-        weights_clip2fmri = F.softmax(sim_clip2fmri_neg, dim=1)  # [B, B]
+            # Softmax to get sampling weights
+            weights_fmri2clip = F.softmax(sim_fmri2clip_neg, dim=1)  # [B, B]
+            weights_clip2fmri = F.softmax(sim_clip2fmri_neg, dim=1)  # [B, B]
 
-        # Step 3: Sample hard negatives with torch.multinomial
+        # Step 2: Sample hard negatives with torch.multinomial
         # Hard negative clip for each fmri
         clip_neg_indices = []
         for b in range(B):
@@ -824,14 +838,14 @@ class ConnecToMind2(nn.Module):
     Output (training):
         fmri_proj: [B, 257, 768] - Q-Former output (Linear + L2 norm)
         clip_proj: [B, 257, 768] - CLIP output (Linear + L2 norm)
-        lowlevel_l1: [B, 4, 28, 28] - VAE latent (for L1 loss)
+        lowlevel_l1: [B, 4, 32, 32] - VAE latent (for Versatile Diffusion 512x512)
         loss_fir: FIR loss
         loss_ftc: FTC loss (ITC-based contrastive)
         loss_fim: FIM loss (3B samples, hard negative mining)
 
     Versatile Diffusion inputs:
         - image_embeds: fmri_proj [B, 257, 768]
-        - image: VAE decode(lowlevel_l1) for image condition
+        - image: VAE decode(lowlevel_l1) for image condition (256x256)
     """
     def __init__(self, seq_len=100, input_dim=3291, embed_dim=768,
                  num_qformer_layers=12, num_query_tokens=100,
@@ -905,7 +919,7 @@ class ConnecToMind2(nn.Module):
         Output: dict
             fmri_proj: [B, 257, 768] - for FIR loss
             clip_proj: [B, 257, 768] - for FIR loss
-            lowlevel_l1: [B, 4, 28, 28] - for L1 loss with vae.encode(image)
+            lowlevel_l1: [B, 4, 32, 32] - for Versatile Diffusion 512x512
             loss_fir: scalar
             loss_ftc: scalar (ITC-based contrastive)
             loss_fim: scalar (BLIP-2 ITM style with 3B samples)
@@ -935,12 +949,12 @@ class ConnecToMind2(nn.Module):
         loss_fim = self.fim_loss_fn(fmri_emb, clip_proj, sim_fmri2clip, sim_clip2fmri, subject_names=subject_names)
 
         # 4. Low-level decoder (원본 fmri_emb만 사용)
-        lowlevel_l1 = self.low_level_decoder(fmri_emb)  # [B, 4, 28, 28]
+        lowlevel_l1 = self.low_level_decoder(fmri_emb)  # [B, 4, 64, 64]
 
         return {
             "fmri_proj": fmri_proj,          # [B, 257, 768]
             "clip_proj": clip_proj,          # [B, 257, 768]
-            "lowlevel_l1": lowlevel_l1,      # [B, 4, 28, 28]
+            "lowlevel_l1": lowlevel_l1,      # [B, 4, 64, 64]
             "loss_fir": loss_fir,
             "loss_ftc": loss_ftc,
             "loss_fim": loss_fim,
@@ -955,7 +969,7 @@ class ConnecToMind2(nn.Module):
             subject_names: list of subject names [B] (for FC prior)
         Output:
             fmri_proj: [B, 257, 768] - Versatile Diffusion의 image_embeds로 사용
-            lowlevel_l1: [B, 4, 28, 28] - VAE decode하면 blurry image
+            lowlevel_l1: [B, 4, 32, 32] - Versatile Diffusion latent (512x512)
         """
         # (a) Region-level embedding
         fmri_emb = self.region_embedding(fmri)  # [B, 100, 768]
@@ -967,11 +981,11 @@ class ConnecToMind2(nn.Module):
         fmri_proj = self.output_proj(qformer_out)  # [B, 257, 768]
 
         # Low-level decoder
-        lowlevel_l1 = self.low_level_decoder(fmri_emb)  # [B, 4, 28, 28]
+        lowlevel_l1 = self.low_level_decoder(fmri_emb)  # [B, 4, 64, 64]
 
         return {
             "fmri_proj": fmri_proj,      # [B, 257, 768]
-            "lowlevel_l1": lowlevel_l1,  # [B, 4, 28, 28]
+            "lowlevel_l1": lowlevel_l1,  # [B, 4, 64, 64]
         }
 
 

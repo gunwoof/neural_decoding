@@ -126,18 +126,23 @@ class TestDataset(Dataset): # sub단위로 실행
         return fmri_avg, image, low_image, image_id
     
 class hug_TrainDataset(Dataset): # ses단위로 실행
-    def __init__(self, fmri_path, image_path, transform):
-        self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['beta']
-        self.cocoid = self.data['stimuli']
+    def __init__(self, beta_path, stimuli_path, image_path, transform):
+        # 기존 NPZ 방식 (주석 처리)
+        # self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
+        # self.fmri = self.data['beta']
+        # self.cocoid = self.data['stimuli']
+
+        # 새로운 NPY 방식
+        self.fmri = np.load(beta_path, mmap_mode='r', allow_pickle=True)  # shape: (N, voxels)
+        self.cocoid = np.load(stimuli_path, allow_pickle=True)  # shape: (N,)
         self.image_path = image_path
         self.transform = transform # PIL.Image -> tensor
-       
+
 
     def __len__(self):
         return len(self.cocoid)
 
-    def __getitem__(self, idx): 
+    def __getitem__(self, idx):
         # fMRI 데이터 로딩
         fmri_vol = torch.tensor(self.fmri[idx], dtype=torch.float32)
 
@@ -150,10 +155,15 @@ class hug_TrainDataset(Dataset): # ses단위로 실행
         return fmri_vol, image
 
 class hug_TestDataset(Dataset): # ses단위로 실행
-    def __init__(self, fmri_path, image_path, low_image_path, transform, use_low_image):
-        self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
-        self.fmri = self.data['beta']
-        self.cocoid = self.data['stimuli']
+    def __init__(self, beta_path, stimuli_path, image_path, low_image_path, transform, use_low_image):
+        # 기존 NPZ 방식 (주석 처리)
+        # self.data = np.load(fmri_path, mmap_mode='r', allow_pickle=True) # 포인터만 받아와서 메모리에 올라온 것은 아님
+        # self.fmri = self.data['beta']
+        # self.cocoid = self.data['stimuli']
+
+        # 새로운 NPY 방식
+        self.fmri = np.load(beta_path, mmap_mode='r', allow_pickle=True)  # shape: (N, voxels)
+        self.cocoid = np.load(stimuli_path, allow_pickle=True)  # shape: (N,)
         self.image_path = image_path
         self.low_image_path = low_image_path
         self.transform = transform # PIL.Image -> tensor
@@ -162,7 +172,7 @@ class hug_TestDataset(Dataset): # ses단위로 실행
     def __len__(self):
         return len(self.cocoid)
 
-    def __getitem__(self, idx): 
+    def __getitem__(self, idx):
         # fMRI 데이터 로딩
         fmri_vol = torch.tensor(self.fmri[idx], dtype=torch.float32)
 
@@ -416,12 +426,18 @@ def sub1_train_dataset_hug(args):
     fmri_detail_dir = args.fmri_detail_dir
     image_dir = args.image_dir
     transform = transforms.ToTensor()
-    
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_train_nsdgeneral.npz"
+
+    # 기존 NPZ 방식 (주석 처리)
+    # fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_beta-train_nsdgeneral.npy"
+    # train_dataset = hug_TrainDataset(fmri_path, image_path, transform)
+
+    # 새로운 NPY 방식 - beta와 stimuli 파일 분리
+    beta_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_beta-train_nsdgeneral.npy"
+    stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_stimuli-train.npy"
     image_path = f"{root_dir}/{image_dir}"
- 
-    train_dataset = hug_TrainDataset(fmri_path, image_path, transform)
-    
+
+    train_dataset = hug_TrainDataset(beta_path, stimuli_path, image_path, transform)
+
     return train_dataset
 
 def sub1_test_dataset_hug(args):
@@ -433,13 +449,19 @@ def sub1_test_dataset_hug(args):
     output_dir= args.output_dir
     transform = transforms.ToTensor()
     use_low_image = args.use_low_image
-    
-    fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_test_nsdgeneral.npz"
+
+    # 기존 NPZ 방식 (주석 처리)
+    # fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_beta-test_nsdgeneral.npy"
+    # test_dataset = hug_TestDataset(fmri_path, image_path, low_image_path, transform, use_low_image)
+
+    # 새로운 NPY 방식 - beta와 stimuli 파일 분리
+    beta_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_beta-test_nsdgeneral.npy"
+    stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/sub-01/sub-01_stimuli-test.npy"
     image_path = f"{root_dir}/{image_dir}"
     low_image_path = f"{root_dir}/{code_dir}/{output_dir}/mindeye1_metric_ourdata/low_recons_test"
- 
-    test_dataset = hug_TestDataset(fmri_path, image_path, low_image_path, transform, use_low_image)
-    
+
+    test_dataset = hug_TestDataset(beta_path, stimuli_path, image_path, low_image_path, transform, use_low_image)
+
     return test_dataset
 
 def sub1_train_dataset_FuncSpatial(args):

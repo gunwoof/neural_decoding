@@ -207,7 +207,7 @@ def load_gt_images_batch(image_dir, image_ids, transform=None):
 @torch.no_grad()
 def versatile_diffusion_reconstruct(
     vd_pipe,
-    img_lowlevel,
+    init_latents,
     brain_clip_embeddings,
     num_inference_steps=20,
     guidance_scale=7.5,
@@ -219,7 +219,7 @@ def versatile_diffusion_reconstruct(
 
     Args:
         vd_pipe: Versatile Diffusion pipeline (DiffusionPipeline)
-        img_lowlevel: [B, 3, 512, 512] blurry image (VAE decoded)
+        init_latents: [B, 4, 64, 64] VAE latent (LowLevelDecoder에서 직접 생성)
         brain_clip_embeddings: [B, 257, 768] fMRI에서 예측한 CLIP embedding
         num_inference_steps: diffusion steps
         guidance_scale: classifier-free guidance scale
@@ -250,10 +250,11 @@ def versatile_diffusion_reconstruct(
     else:
         input_embedding = brain_clip_embeddings
 
-    # img2img: blurry image를 초기 latent로 사용
-    if img_lowlevel is not None and img2img_strength < 1.0:
-        # img_lowlevel [B, 3, 512, 512] -> VAE encode -> latent [B, 4, 64, 64]
-        init_latents = vae.encode(img_lowlevel.half() * 2 - 1).latent_dist.sample() * 0.18215
+    # img2img: init_latents를 초기 latent로 직접 사용 (VAE encode 불필요)
+    if init_latents is not None and img2img_strength < 1.0:
+        # init_latents [B, 4, 64, 64] - LowLevelDecoder에서 직접 생성
+        # Training 시 0.18215 scale로 학습되었으므로 그대로 사용
+        init_latents = init_latents.half()
 
         # img2img timestep 계산
         init_timestep = min(int(num_inference_steps * img2img_strength), num_inference_steps)

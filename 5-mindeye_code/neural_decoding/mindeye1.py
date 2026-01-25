@@ -13,7 +13,7 @@ from scipy.stats import pearsonr
 
 # for clip
 import clip # OpenAI CLIP (RN50, ViT-L/14 등)
-import open_clip # OpenAI CLIP (RN50, ViT-L/14 등) + LAION-5B로 학습한 모델
+# import open_clip # OpenAI CLIP (RN50, ViT-L/14 등) + LAION-5B로 학습한 모델
 from transformers import CLIPVisionModelWithProjection
 
 # for prior
@@ -758,7 +758,8 @@ def get_model_highlevel(args):
 
     if args.subj == 1:
         # num_voxels = 15724
-        num_voxels = 101319
+        # num_voxels = 17355
+        num_voxels = 11904
     elif args.subj == 2:
         num_voxels = 14278
     elif args.subj == 3:

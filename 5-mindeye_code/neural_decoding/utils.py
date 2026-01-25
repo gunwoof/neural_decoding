@@ -14,7 +14,7 @@ from kornia.augmentation.container import AugmentationSequential
 # mixco
 import torch.nn.functional as F
 
-from pretrained_cache.generative_models.sgm.util import append_dims
+# from pretrained_cache.generative_models.sgm.util import append_dims  # MindEye2에서만 사용 - main_high_all()에서는 불필요
 
 # seed
 def seed_everything(seed=0, cudnn_deterministic=True):
@@ -558,6 +558,8 @@ def soft_cont_loss(student_preds, teacher_preds, teacher_aug_preds, temp=0.125, 
 
 
 def unclip_recon(x, diffusion_engine, vector_suffix, num_samples=1, offset_noise_level=0.04, device="cuda"):
+    from pretrained_cache.generative_models.sgm.util import append_dims  # MindEye2 전용 - 필요할 때만 import
+
     with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16), diffusion_engine.ema_scope():
         batch_size = x.shape[0]
         z = torch.randn(batch_size,4,96,96).to(device) # starting noise, can change to VAE outputs of initial image for img2img
@@ -598,7 +600,7 @@ def unclip_recon(x, diffusion_engine, vector_suffix, num_samples=1, offset_noise
 def sdxl_recon(inference_batch_size, image, prompt, base_engine, base_text_embedder1, base_text_embedder2, vector_suffix, crossattn_uc, vector_uc, num_samples=1, img2img_timepoint=13, device="cuda"):
     """
     SDXL base engine으로 coarse reconstruction을 refinement/upscale 하는 함수.
-    
+
     Args:
         image (Tensor): coarse reconstruction, shape (B,3,H,W), 값 범위 [0,1]
         prompt (list[str]): caption prompt 리스트, 길이 B
@@ -609,10 +611,12 @@ def sdxl_recon(inference_batch_size, image, prompt, base_engine, base_text_embed
         num_samples (int): 샘플링할 이미지 수
         img2img_timepoint (int): 얼마나 noisy하게 다시 시작할지 (클수록 coarse하게 재샘플링)
         device (str): 실행 디바이스
-    
+
     Returns:
         samples (Tensor): refinement된 이미지, shape (B,3,H,W)
     """
+    from pretrained_cache.generative_models.sgm.util import append_dims  # MindEye2 전용 - 필요할 때만 import
+
     with torch.no_grad(), base_engine.ema_scope():
         
         # 1. VAE encode

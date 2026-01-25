@@ -25,11 +25,11 @@ def parse_args():
         help="epoch 개수"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=47,
+        "--batch_size", type=int, default=40,
         help="Batch size (H100:64, L40:32)"
     )
     parser.add_argument(
-        "--inference_batch_size", type=int, default=47,
+        "--inference_batch_size", type=int, default=40,
         help="train batch size와 동일하게 설정"
     )
     parser.add_argument(
@@ -112,11 +112,11 @@ def parse_args():
         help="FIR (fMRI-Image Reconstruction) loss weight"
     )
     parser.add_argument(
-        "--ftc_weight", type=float, default=1.0,
+        "--ftc_weight", type=float, default=0.5,
         help="FTC (fMRI-Text Contrastive) loss weight"
     )
     parser.add_argument(
-        "--fim_weight", type=float, default=1.0,
+        "--fim_weight", type=float, default=0.1,
         help="FIM (matching) loss weight"
     )
     parser.add_argument(
@@ -131,7 +131,7 @@ def parse_args():
         help="Optimizer type"
     )
     parser.add_argument(
-        "--max_lr", type=float, default=3e-4,
+        "--max_lr", type=float, default=1e-4, #3e-4에서 내림
         help="Maximum learning rate"
     )
     parser.add_argument(

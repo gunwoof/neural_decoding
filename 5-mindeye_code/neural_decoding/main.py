@@ -28,12 +28,12 @@ from trainer import train, inference, evaluate, retrieval_evaluate
 from all_trainer import high_train_inference_evaluate, low_train_inference_evaluate
 from utils import seed_everything, get_unique_path, save_gt_vs_recon_images
 
-# mindeye2
-from args_mindeye2 import parse_args2
-from data import get_dataloader_hug2, train_dataset_hug2
-from mindeye2 import get_pretrain_model, get_model
-from optimizers import get_optimizer_mindeye2
-from all_trainer_mindeye2 import pre_train, fine_tunning_train, inference_evaluate, pre_train_continous
+# mindeye2 (main_high_all()에서는 사용하지 않음 - 주석 처리)
+# from args_mindeye2 import parse_args2
+# from data import get_dataloader_hug2, train_dataset_hug2
+# from mindeye2 import get_pretrain_model, get_model
+# from optimizers import get_optimizer_mindeye2
+# from all_trainer_mindeye2 import pre_train, fine_tunning_train, inference_evaluate, pre_train_continous
 
 def main():
     # parse_args 정의

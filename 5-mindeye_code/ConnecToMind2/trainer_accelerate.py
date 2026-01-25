@@ -271,9 +271,11 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 
         # ============ Low-level L1 Loss ============
         # VAE encode target (VAE는 float32이므로 변환 필요)
+        # lowlevel_l1이 [B, 4, 32, 32] (256x256 기준)이므로 image도 256로 resize
         with torch.no_grad():
-            image_f32 = image.float()  # bf16 -> float32 for VAE
-            vae_target = vae.encode(2 * image_f32 - 1).latent_dist.mode() * 0.18215  # [B, 4, 28, 28]
+            image_256 = F.interpolate(image, (256, 256), mode='bilinear', align_corners=False)
+            image_f32 = image_256.float()  # bf16 -> float32 for VAE
+            vae_target = vae.encode(2 * image_f32 - 1).latent_dist.mode() * 0.18215  # [B, 4, 32, 32]
             vae_target = vae_target.to(dtype=torch.bfloat16)  # 다시 bf16으로 변환
 
         loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
@@ -288,10 +290,6 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
         # Accelerator가 scaling + gradient sync 자동 처리
         # DeepSpeed: gradient clipping은 deepspeed_config.json에서 설정 (1.0)
         accelerator.backward(loss)
-
-        # ============ Gradient Logging ============
-        if args.log_grad_every > 0 and current_step % args.log_grad_every == 0:
-            log_gradient_stats(model, current_step, accelerator, wandb_log=args.wandb_log)
 
         # Optimizer step
         optimizer.step()
@@ -316,6 +314,48 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "train/loss_l1": loss_l1.item(),
                 "train/lr": lrs_log[-1],
             }
+
+            # ============ Debug: NaN/Inf and Value Range Check ============
+            # Get unwrapped model for accessing internal parameters
+            model_unwrapped = accelerator.unwrap_model(model)
+
+            debug_logs = {
+                # Input data
+                "debug/fmri_nan": int(torch.isnan(fmri).any().item()),
+                "debug/fmri_inf": int(torch.isinf(fmri).any().item()),
+                "debug/fmri_min": fmri.min().item(),
+                "debug/fmri_max": fmri.max().item(),
+                # Output embeddings
+                "debug/fmri_proj_nan": int(torch.isnan(outputs["fmri_proj"]).any().item()),
+                "debug/fmri_proj_inf": int(torch.isinf(outputs["fmri_proj"]).any().item()),
+                "debug/fmri_proj_min": outputs["fmri_proj"].min().item(),
+                "debug/fmri_proj_max": outputs["fmri_proj"].max().item(),
+                "debug/clip_proj_nan": int(torch.isnan(outputs["clip_proj"]).any().item()),
+                "debug/clip_proj_inf": int(torch.isinf(outputs["clip_proj"]).any().item()),
+                "debug/clip_proj_min": outputs["clip_proj"].min().item(),
+                "debug/clip_proj_max": outputs["clip_proj"].max().item(),
+                # Low-level decoder output
+                "debug/lowlevel_nan": int(torch.isnan(outputs["lowlevel_l1"]).any().item()),
+                "debug/lowlevel_inf": int(torch.isinf(outputs["lowlevel_l1"]).any().item()),
+                "debug/lowlevel_min": outputs["lowlevel_l1"].min().item(),
+                "debug/lowlevel_max": outputs["lowlevel_l1"].max().item(),
+                # VAE target
+                "debug/vae_target_nan": int(torch.isnan(vae_target).any().item()),
+                "debug/vae_target_inf": int(torch.isinf(vae_target).any().item()),
+                "debug/vae_target_min": vae_target.min().item(),
+                "debug/vae_target_max": vae_target.max().item(),
+                # Losses
+                "debug/loss_nan": int(torch.isnan(loss).item()),
+                "debug/loss_inf": int(torch.isinf(loss).item()),
+                "debug/loss_fir_nan": int(torch.isnan(loss_fir).item()),
+                "debug/loss_ftc_nan": int(torch.isnan(loss_ftc).item()),
+                "debug/loss_fim_nan": int(torch.isnan(loss_fim).item()),
+                "debug/loss_l1_nan": int(torch.isnan(loss_l1).item()),
+                "debug/loss_l1_inf": int(torch.isinf(loss_l1).item()),
+                # Temperature (FTC loss)
+                "debug/ftc_temp": model_unwrapped.ftc_loss_fn.temp.item(),
+            }
+            logs.update(debug_logs)
 
             if isinstance(progress_bar, tqdm):
                 progress_bar.set_postfix(
@@ -367,8 +407,10 @@ def validate(args, model, vae, val_loader, accelerator):
         loss_fim = outputs["loss_fim"]
 
         # Low-level L1 Loss (VAE는 float32이므로 변환 필요)
-        image_f32 = image.float()
-        vae_target = vae.encode(2 * image_f32 - 1).latent_dist.mode() * 0.18215
+        # lowlevel_l1이 [B, 4, 32, 32] (256x256 기준)이므로 image도 256으로 resize
+        image_256 = F.interpolate(image, (256, 256), mode='bilinear', align_corners=False)
+        image_f32 = image_256.float()
+        vae_target = vae.encode(2 * image_f32 - 1).latent_dist.mode() * 0.18215  # [B, 4, 32, 32]
         vae_target = vae_target.to(dtype=torch.bfloat16)
         loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
 
@@ -437,21 +479,24 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         # ============ Forward Inference ============
         outputs = model_unwrapped.inference(fmri, subject_names=subject_name)
         fmri_proj = outputs["fmri_proj"]      # [B, 257, 768]
-        lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 28, 28]
+        lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 32, 32] (256x256 기준)
 
-        # ============ VAE Decode (Blurry Image) ============
-        # VAE는 float32이므로 변환 필요
+        # ============ VAE Decode (Blurry Image for saving) ============
+        # lowlevel_l1: [B, 4, 32, 32] → VAE Decode → [B, 3, 256, 256]
         lowlevel_f32 = (lowlevel_l1 / 0.18215).float()
-        blurry_image = vae.decode(lowlevel_f32).sample / 2 + 0.5  # [B, 3, 224, 224]
+        blurry_image = vae.decode(lowlevel_f32).sample / 2 + 0.5  # [B, 3, 256, 256]
         blurry_image = blurry_image.clamp(0, 1)
 
-        # 512x512로 resize
+        # ============ Versatile Diffusion용 latent 생성 ============
+        # 256x256 → 512x512 resize → VAE Encode → [B, 4, 64, 64]
         blurry_512 = F.interpolate(blurry_image, (512, 512), mode='bilinear', align_corners=False)
+        blurry_512_f32 = blurry_512.float()
+        init_latents_64 = vae.encode(2 * blurry_512_f32 - 1).latent_dist.mode() * 0.18215  # [B, 4, 64, 64]
 
         # ============ Versatile Diffusion Reconstruction ============
         recon_tensors = versatile_diffusion_reconstruct(
             versatile_diffusion,
-            blurry_512,
+            init_latents_64,  # [B, 4, 64, 64] (512x512 기준)
             fmri_proj,
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
@@ -472,7 +517,7 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         num_samples += len(image_ids)
 
         # 메모리 정리
-        del recon_tensors, gt_tensors, fmri_proj, lowlevel_l1, blurry_image, blurry_512
+        del recon_tensors, gt_tensors, fmri_proj, lowlevel_l1, blurry_image
 
     # GPU 메모리 정리
     torch.cuda.empty_cache()
@@ -545,93 +590,3 @@ def compute_metrics(args, all_recons, all_targets, metrics):
     return results
 
 
-# ============================================================================
-# Gradient Logging
-# ============================================================================
-
-def log_gradient_stats(model, step, accelerator, wandb_log=False):
-    """
-    모든 레이어의 gradient 통계 로깅 (norm, mean, std)
-
-    Args:
-        model: 학습 중인 모델
-        step: 현재 global step
-        accelerator: Accelerate accelerator
-        wandb_log: WandB에 로깅할지 여부
-    """
-    # DDP unwrap
-    model_unwrapped = accelerator.unwrap_model(model)
-
-    grad_stats = {}
-
-    for name, param in model_unwrapped.named_parameters():
-        if param.grad is not None:
-            grad = param.grad.data
-            grad_stats[name] = {
-                'norm': grad.norm(2).item(),
-                'mean': grad.mean().item(),
-                'std': grad.std().item(),
-            }
-
-    # 콘솔 출력 (그룹별 요약)
-    if accelerator.is_main_process:
-        print(f"\n{'='*60}")
-        print(f"[Step {step}] Gradient Statistics")
-        print(f"{'='*60}")
-
-        # 레이어 그룹별 정리
-        groups = {
-            'region_embedding': [],
-            'connectome_qformer.query_tokens': [],
-            'connectome_qformer.blocks': [],
-            'connectome_qformer.final_ln': [],
-            'output_proj': [],
-            'low_level_decoder': [],
-            'fim_classifier': [],
-            'clip_encoder': [],
-            'other': [],
-        }
-
-        for name, stats in grad_stats.items():
-            matched = False
-            for group_name in groups.keys():
-                if group_name in name:
-                    groups[group_name].append((name, stats))
-                    matched = True
-                    break
-            if not matched:
-                groups['other'].append((name, stats))
-
-        # 그룹별 출력
-        for group_name, items in groups.items():
-            if not items:
-                continue
-
-            # 그룹 평균 계산
-            avg_norm = np.mean([s['norm'] for _, s in items])
-            avg_mean = np.mean([s['mean'] for _, s in items])
-            avg_std = np.mean([s['std'] for _, s in items])
-
-            print(f"\n[{group_name}] ({len(items)} params)")
-            print(f"  avg norm={avg_norm:.6f}, mean={avg_mean:.6f}, std={avg_std:.6f}")
-
-            # 문제 감지
-            for name, stats in items:
-                if stats['norm'] < 1e-7:
-                    print(f"  ⚠️  VANISHING: {name} (norm={stats['norm']:.2e})")
-                elif stats['norm'] > 100:
-                    print(f"  ⚠️  EXPLODING: {name} (norm={stats['norm']:.2e})")
-
-        print(f"{'='*60}\n")
-
-        # WandB 로깅 (상세)
-        if wandb_log:
-            wandb_logs = {}
-            for name, stats in grad_stats.items():
-                # 이름 정리 (wandb 경로용)
-                clean_name = name.replace('.', '/')
-                wandb_logs[f"grad/{clean_name}/norm"] = stats['norm']
-                wandb_logs[f"grad/{clean_name}/mean"] = stats['mean']
-                wandb_logs[f"grad/{clean_name}/std"] = stats['std']
-
-            wandb.log(wandb_logs, step=step)

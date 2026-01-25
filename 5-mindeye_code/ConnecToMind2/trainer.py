@@ -14,7 +14,7 @@ Epoch 로직:
        - ConvNext Loss: feature contrastive
     2. Evaluation: fMRI -> ConnecToMind2 -> Versatile Diffusion -> Reconstructed Image
        - fmri_proj [B, 257, 768]: Versatile Diffusion의 image_embeds
-       - lowlevel_l1 [B, 4, 28, 28]: VAE decode -> blurry image
+       - lowlevel_l1 [B, 4, 64, 64]: VAE latent (512x512) -> Versatile Diffusion
     3. Metric: PixCorr, SSIM, AlexNet2/5, CLIP, Inception, EfficientNet, SwAV
 """
 
@@ -216,12 +216,12 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, sca
            - fmri [B, 200, input_dim] -> Region-level embedding -> [B, 200, 768]
            - Connectome-Q-Former -> [B, 201, 768]
            - Output Projection -> fmri_proj [B, 257, 768]
-           - Low-level Decoder -> lowlevel_l1 [B, 4, 28, 28], lowlevel_aux [B, 49, 512]
+           - Low-level Decoder -> lowlevel_l1 [B, 4, 64, 64] (512x512 기준)
            - loss_fir: FIR loss (MSE, Q-T 마스크 적용)
            - loss_fim: FIM loss (BCE, 마스크 없음)
 
         2. Low-level L1 loss 계산
-           - target: vae.encode(image) -> [B, 4, 28, 28]
+           - target: vae.encode(image_512) -> [B, 4, 64, 64]
            - pred: lowlevel_l1
 
         3. ConvNext contrastive loss 계산
@@ -262,9 +262,10 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, sca
             loss_fim = outputs["loss_fim"]
 
             # ============ Low-level L1 Loss ============
-            # VAE encode target
+            # VAE encode target (lowlevel_l1이 [B, 4, 64, 64]이므로 image도 512로 resize)
             with torch.no_grad():
-                vae_target = vae.encode(2 * image - 1).latent_dist.mode() * 0.18215  # [B, 4, 28, 28]
+                image_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False)
+                vae_target = vae.encode(2 * image_512 - 1).latent_dist.mode() * 0.18215  # [B, 4, 64, 64]
 
             loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
 
@@ -396,15 +397,14 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
     단계:
         1. fMRI -> ConnecToMind2.inference()
            - fmri_proj: [B, 257, 768] - Versatile Diffusion의 image_embeds (conditioning)
-           - lowlevel_l1: [B, 4, 28, 28] - VAE latent
+           - lowlevel_l1: [B, 4, 64, 64] - VAE latent (512x512 기준)
 
-        2. VAE decode lowlevel_l1 -> blurry image [B, 3, 224, 224]
-           - 512x512로 resize
+        2. VAE decode lowlevel_l1 -> blurry image [B, 3, 512, 512] (저장용)
 
         3. Versatile Diffusion (image variation)
-           - image: blurry image (low-level structure)
+           - init_latents: lowlevel_l1 [B, 4, 64, 64] (직접 전달)
            - image_embeds: fmri_proj [B, 257, 768] (high-level semantic conditioning)
-           -> Reconstructed image [B, 3, H, W]
+           -> Reconstructed image [B, 3, 512, 512]
 
         4. 배치마다 디스크에 저장 (Subject별 디렉토리)
 
@@ -435,19 +435,18 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         # ============ Forward Inference ============
         outputs = model.inference(fmri, subject_names=subject_names)
         fmri_proj = outputs["fmri_proj"]      # [B, 257, 768] - conditioning
-        lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 28, 28] - VAE latent
+        lowlevel_l1 = outputs["lowlevel_l1"]  # [B, 4, 64, 64] - VAE latent
 
-        # ============ VAE Decode (Blurry Image) ============
-        blurry_image = vae.decode(lowlevel_l1 / 0.18215).sample / 2 + 0.5  # [B, 3, 224, 224]
+        # ============ VAE Decode (Blurry Image for saving) ============
+        # lowlevel_l1은 0.18215 scale로 학습됨 -> VAE decode 시 / 0.18215 필요
+        blurry_image = vae.decode(lowlevel_l1 / 0.18215).sample / 2 + 0.5  # [B, 3, 512, 512]
         blurry_image = blurry_image.clamp(0, 1)
 
-        # 512x512로 resize (Versatile Diffusion 입력)
-        blurry_512 = F.interpolate(blurry_image, (512, 512), mode='bilinear', align_corners=False)
-
         # ============ Versatile Diffusion Reconstruction ============
+        # lowlevel_l1을 직접 init_latents로 전달 (이미 0.18215 scale)
         recon_tensors = versatile_diffusion_reconstruct(
             versatile_diffusion,
-            blurry_512,
+            lowlevel_l1,  # [B, 4, 64, 64] 직접 전달
             fmri_proj,  # [B, 257, 768]
             num_inference_steps=args.num_inference_steps,
             guidance_scale=args.guidance_scale,
@@ -456,7 +455,7 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         )  # [B, 3, 512, 512] Tensor
 
         # ============ Ground Truth 이미지 (DataLoader에서 이미 로드됨) ============
-        gt_tensors = gt_images  # [B, 3, 224, 224] - 이중 로드 제거
+        gt_tensors = gt_images  # [B, 3, 224, 224]
 
         # ============ 배치 단위로 디스크에 저장 ============
         save_recon_batch(recon_tensors, gt_tensors, image_ids, save_dir, subject)
@@ -464,7 +463,7 @@ def evaluate(args, model, vae, versatile_diffusion, test_loader, epoch, subject,
         num_samples += len(image_ids)
 
         # 메모리 정리
-        del recon_tensors, gt_tensors, fmri_proj, lowlevel_l1, blurry_image, blurry_512
+        del recon_tensors, gt_tensors, fmri_proj, lowlevel_l1, blurry_image
 
     # GPU 메모리 정리
     torch.cuda.empty_cache()
