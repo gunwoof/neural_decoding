@@ -81,11 +81,12 @@ def train_dataset(args):
     fmri_detail_dir = args.fmri_detail_dir
     image_dir = args.image_dir
     subjects = args.subjects
+    roi_suffix = args.roi_suffix  # e.g., 'dk', 'destrieux', 'schaefer', etc.
     transform = transforms.ToTensor()
 
     datasets = []
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-train_schaefer100.npy"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-train_{roi_suffix}.npy"
         stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli-train.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets.append(TrainDataset_ourdata(fmri_path, stimuli_path, image_path, transform))
@@ -100,11 +101,12 @@ def test_dataset(args):
     fmri_detail_dir = args.fmri_detail_dir
     image_dir = args.image_dir
     subjects = args.subjects
+    roi_suffix = args.roi_suffix  # e.g., 'dk', 'destrieux', 'schaefer', etc.
     transform = transforms.ToTensor()
 
     datasets = {}
     for sub in subjects:
-        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-test_schaefer100.npy"
+        fmri_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_beta-test_{roi_suffix}.npy"
         stimuli_path = f"{root_dir}/{fmri_dir}/{fmri_detail_dir}/{sub}/{sub}_stimuli-test.npy"
         image_path = f"{root_dir}/{image_dir}"
         datasets[sub] = TestDataset_ourdata(fmri_path, stimuli_path, image_path, transform)

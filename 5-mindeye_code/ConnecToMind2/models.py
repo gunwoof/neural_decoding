@@ -3,7 +3,7 @@ ConnecToMind2 - Model2 Implementation (BLIP-2 ITC+ITM Style)
 
 BLIP-2 공식 방식 완전 적용:
     [ITC - Contrastive Learning]
-    - FTCLoss: fMRI-Text(CLIP) Contrastive
+    - FICLoss: fMRI-Image Contrastive
     - Bidirectional: fMRI→CLIP + CLIP→fMRI
     - Max pooling over query tokens
     - Learnable temperature + label smoothing
@@ -14,7 +14,7 @@ BLIP-2 공식 방식 완전 적용:
     - Classifier: nn.Linear(768, 2) - 2-class
     - Query 사용: 모든 100개 query 토큰 사용
     - Logit 평균화: mean(dim=1) - 모든 query 평균
-    - Hard Negative Mining: FTC similarity 기반 torch.multinomial sampling
+    - Hard Negative Mining: FIC similarity 기반 torch.multinomial sampling
     - 3B Triplet: pos+pos(matched), pos+neg_clip(unmatched), neg_fmri+pos(unmatched)
 
 커스텀 유지 (fMRI-Image Matching):
@@ -35,7 +35,7 @@ Architecture (from diagram):
         -> Linear layer + L2 norm -> [B, 257, 768]
 
 Loss = FIR Loss (fMRI embedding vs CLIP embedding, L1)
-     + FTC Loss (BLIP-2 ITC style: bidirectional contrastive)
+     + FIC Loss (BLIP-2 ITC style: bidirectional contrastive)
      + FIM Loss (BLIP-2 ITM style: 3B samples with hard negative mining)
      + Low-level Loss (L1 with target image)
 
@@ -231,7 +231,7 @@ class ConnectomeQFormer(nn.Module):
     def __init__(self, hidden_size=768, num_heads=12, num_layers=12,
                  num_query_tokens=100, dropout=0.1, cross_attention_freq=2,
                  clip_model_name="openai/clip-vit-base-patch16",
-                 is_fc=False, subjects=None, fc_base_dir=None):
+                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100'):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -264,7 +264,7 @@ class ConnectomeQFormer(nn.Module):
         # FC prior 초기화 (subject별로 저장)
         self.fc_priors = {}  # Dict[subject_name, Tensor[100, 100]]
         if is_fc and subjects is not None and fc_base_dir is not None:
-            self._load_fc_priors(subjects, fc_base_dir, num_query_tokens)
+            self._load_fc_priors(subjects, fc_base_dir, num_query_tokens, roi_suffix)
 
         # Initialize from CLIP weights
         self._init_from_clip(clip_model_name)
@@ -317,7 +317,7 @@ class ConnectomeQFormer(nn.Module):
         del clip_model
         print(f"✅ Q-Former initialized from CLIP ViT-B/16 (12 layers, hidden_size=768)")
 
-    def _load_fc_priors(self, subjects, fc_base_dir, num_query_tokens):
+    def _load_fc_priors(self, subjects, fc_base_dir, num_query_tokens, roi_suffix):
         """
         모든 subject의 FC prior를 로드하고 num_heads만큼 확장하여 저장
 
@@ -325,6 +325,7 @@ class ConnectomeQFormer(nn.Module):
             subjects: list of subject names (e.g., ["sub-01", "sub-02", "sub-05", "sub-07"])
             fc_base_dir: base directory for FC prior files
             num_query_tokens: number of query tokens (100)
+            roi_suffix: ROI atlas suffix (e.g., 'dk', 'destrieux', 'schaefer100')
 
         FC prior shape: [100, 100] → Cross-attention mask: [num_heads, 100, 100]
             - 100개 ROI queries에 FC prior 직접 적용
@@ -336,7 +337,7 @@ class ConnectomeQFormer(nn.Module):
 
         for sub in subjects:
             # FC prior 파일 경로
-            fc_path = f"{fc_base_dir}/{sub}/{sub}_FC_schaefer-100.npy"
+            fc_path = f"{fc_base_dir}/{sub}/{sub}_FC_{roi_suffix}.npy"
 
             if not os.path.exists(fc_path):
                 print(f"⚠️  FC prior not found: {fc_path}")
@@ -609,9 +610,9 @@ class FIRLoss(nn.Module):
         return self.l1(fmri_emb, clip_emb)
 
 
-class FTCLoss(nn.Module):
+class FICLoss(nn.Module):
     """
-    FTC Loss (fMRI-Text(CLIP) Contrastive): BLIP-2 ITC 방식
+    FIC Loss (fMRI-Image Contrastive): BLIP-2 ITC 방식
 
     BLIP-2 ITC 구현:
         1. fMRI features (all tokens) vs CLIP features (CLS token) similarity 계산
@@ -639,7 +640,7 @@ class FTCLoss(nn.Module):
             fmri_proj [B, 257, 768] - fMRI embeddings (L2 normalized)
             clip_proj [B, 257, 768] - CLIP embeddings (L2 normalized)
         Output:
-            loss_ftc: scalar
+            loss_fic: scalar
             sim_fmri2clip: [B, B] - for hard negative mining in FIM
             sim_clip2fmri: [B, B] - for hard negative mining in FIM
         """
@@ -674,12 +675,12 @@ class FTCLoss(nn.Module):
         targets = torch.arange(B, device=device, dtype=torch.long)
 
         # Bidirectional contrastive loss (BLIP-2 ITC style)
-        loss_ftc = (
+        loss_fic = (
             F.cross_entropy(sim_fmri2clip, targets, label_smoothing=self.label_smoothing)
             + F.cross_entropy(sim_clip2fmri, targets, label_smoothing=self.label_smoothing)
         ) / 2
 
-        return loss_ftc, sim_fmri2clip, sim_clip2fmri
+        return loss_fic, sim_fmri2clip, sim_clip2fmri
 
 
 class FIMLoss(nn.Module):
@@ -701,8 +702,8 @@ class FIMLoss(nn.Module):
     Shapes:
         fmri_emb: [B, 100, 768] - Region-level embeddings
         clip_proj: [B, 257, 768] - CLIP embeddings
-        sim_fmri2clip: [B, B] - fMRI→CLIP similarity (from FTC)
-        sim_clip2fmri: [B, B] - CLIP→fMRI similarity (from FTC)
+        sim_fmri2clip: [B, B] - fMRI→CLIP similarity (from FIC)
+        sim_clip2fmri: [B, B] - CLIP→fMRI similarity (from FIC)
         Output: scalar loss
     """
     def __init__(self, qformer, fim_classifier):
@@ -715,8 +716,8 @@ class FIMLoss(nn.Module):
         Input:
             fmri_emb [B, 100, 768] - Region-level embeddings
             clip_proj [B, 257, 768] - CLIP embeddings
-            sim_fmri2clip [B, B] - fMRI→CLIP similarity (from FTC)
-            sim_clip2fmri [B, B] - CLIP→fMRI similarity (from FTC)
+            sim_fmri2clip [B, B] - fMRI→CLIP similarity (from FIC)
+            sim_clip2fmri [B, B] - CLIP→fMRI similarity (from FIC)
             subject_names: list of subject names [B] (for FC prior)
         Output:
             loss_fim: scalar
@@ -806,7 +807,7 @@ class ConnecToMind2(nn.Module):
     ConnecToMind2 - Model2 (BLIP-2 ITC+ITM Style)
 
     BLIP-2 방식 완전 적용:
-        [FTCLoss - Contrastive Learning (ITC 기반)]
+        [FICLoss - Contrastive Learning (ITC 기반)]
         - Bidirectional contrastive loss (fMRI→CLIP + CLIP→fMRI)
         - Max pooling over query tokens
         - Learnable temperature + label smoothing
@@ -816,7 +817,7 @@ class ConnecToMind2(nn.Module):
         - Classifier: nn.Linear(768, 2) - 2-class
         - Query 사용: 모든 100개 query 토큰 사용
         - Logit 평균화: mean(dim=1) - 모든 query 평균
-        - Hard Negative Mining: FTC similarity 기반 sampling
+        - Hard Negative Mining: FIC similarity 기반 sampling
         - 3B Triplet: pos+pos(1), pos+neg_clip(0), neg_fmri+pos(0)
 
     Architecture:
@@ -831,7 +832,7 @@ class ConnecToMind2(nn.Module):
             -> Linear layer + L2 norm -> [B, 257, 768]
 
     Loss = FIR Loss (fMRI embedding vs CLIP embedding, L1)
-         + FTC Loss (BLIP-2 ITC style: bidirectional contrastive)
+         + FIC Loss (BLIP-2 ITC style: bidirectional contrastive)
          + FIM Loss (BLIP-2 ITM style: 3B samples with hard negatives)
          + Low-level Loss (VAE L1)
 
@@ -840,7 +841,7 @@ class ConnecToMind2(nn.Module):
         clip_proj: [B, 257, 768] - CLIP output (Linear + L2 norm)
         lowlevel_l1: [B, 4, 32, 32] - VAE latent (for Versatile Diffusion 512x512)
         loss_fir: FIR loss
-        loss_ftc: FTC loss (ITC-based contrastive)
+        loss_fic: FIC loss (ITC-based contrastive)
         loss_fim: FIM loss (3B samples, hard negative mining)
 
     Versatile Diffusion inputs:
@@ -849,7 +850,7 @@ class ConnecToMind2(nn.Module):
     """
     def __init__(self, seq_len=100, input_dim=3291, embed_dim=768,
                  num_qformer_layers=12, num_query_tokens=100,
-                 is_fc=False, subjects=None, fc_base_dir=None):
+                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100'):
         super().__init__()
 
         self.seq_len = seq_len
@@ -875,7 +876,8 @@ class ConnecToMind2(nn.Module):
             dropout=0.1,
             is_fc=is_fc,
             subjects=subjects,
-            fc_base_dir=fc_base_dir
+            fc_base_dir=fc_base_dir,
+            roi_suffix=roi_suffix
         )
 
         # 4. Output Projection: [B, 100, 768] -> [B, 257, 768]
@@ -893,7 +895,7 @@ class ConnecToMind2(nn.Module):
 
         # 7. Loss functions
         self.fir_loss_fn = FIRLoss()
-        self.ftc_loss_fn = FTCLoss(temperature=0.07, label_smoothing=0.1)
+        self.fic_loss_fn = FICLoss(temperature=0.07, label_smoothing=0.1)
         self.fim_loss_fn = FIMLoss(qformer=self.connectome_qformer, fim_classifier=self.fim_classifier)
 
     def forward(self, fmri, images, device, subject_names=None):
@@ -901,13 +903,13 @@ class ConnecToMind2(nn.Module):
         Training forward (Q-Former 2번 호출: FIR용 마스크 O, FIM용 마스크 X)
 
         FIR: Q-T 상호 차단 마스크 사용 (Query가 CLIP을 직접 보면 cheating)
-        FTC: ITC 기반 contrastive learning (fMRI-CLIP alignment)
+        FIC: ITC 기반 contrastive learning (fMRI-CLIP alignment)
         FIM: 마스크 없음 (Query가 CLIP을 보고 matching 판단)
              Hard Negative Mining + 3B samples (BLIP-2 ITM 공식 방식)
 
         Loss Classes:
             - FIRLoss: L1 loss (fmri_proj vs clip_proj)
-            - FTCLoss: Bidirectional contrastive loss (ITC 방식)
+            - FICLoss: Bidirectional contrastive loss (ITC 방식)
             - FIMLoss: Binary classification with hard negative mining (ITM 방식)
 
         Input:
@@ -921,7 +923,7 @@ class ConnecToMind2(nn.Module):
             clip_proj: [B, 257, 768] - for FIR loss
             lowlevel_l1: [B, 4, 32, 32] - for Versatile Diffusion 512x512
             loss_fir: scalar
-            loss_ftc: scalar (ITC-based contrastive)
+            loss_fic: scalar (ITC-based contrastive)
             loss_fim: scalar (BLIP-2 ITM style with 3B samples)
         """
         B = fmri.size(0)
@@ -942,8 +944,8 @@ class ConnecToMind2(nn.Module):
         # 1. FIR Loss (L1)
         loss_fir = self.fir_loss_fn(fmri_proj, clip_proj)
 
-        # 2. FTC Loss (ITC-based Contrastive) - returns similarity matrices for hard negative mining
-        loss_ftc, sim_fmri2clip, sim_clip2fmri = self.ftc_loss_fn(fmri_proj, clip_proj)
+        # 2. FIC Loss (ITC-based Contrastive) - returns similarity matrices for hard negative mining
+        loss_fic, sim_fmri2clip, sim_clip2fmri = self.fic_loss_fn(fmri_proj, clip_proj)
 
         # 3. FIM Loss (ITM with Hard Negative Mining)
         loss_fim = self.fim_loss_fn(fmri_emb, clip_proj, sim_fmri2clip, sim_clip2fmri, subject_names=subject_names)
@@ -956,7 +958,7 @@ class ConnecToMind2(nn.Module):
             "clip_proj": clip_proj,          # [B, 257, 768]
             "lowlevel_l1": lowlevel_l1,      # [B, 4, 64, 64]
             "loss_fir": loss_fir,
-            "loss_ftc": loss_ftc,
+            "loss_fic": loss_fic,
             "loss_fim": loss_fim,
         }
 
@@ -1025,6 +1027,7 @@ def get_model(args):
         is_fc=args.is_fc,
         subjects=args.subjects,
         fc_base_dir=fc_base_dir,
+        roi_suffix=args.roi_suffix,
     )
 
     # High-level reconstruction 용도 -> Versatile Diffusion pipeline

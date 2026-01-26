@@ -66,7 +66,7 @@ def parse_args():
     )
     parser.add_argument(
         "--fmri_detail_dir", type=str, default="connectomind2",
-        choices=["connectomind2", "beta_mni_2mm"],
+        choices=["connectomind2", "beta_mni_2mm","connectomind1"],
         help="fMRI preprocessing type"
     )
     parser.add_argument(
@@ -76,6 +76,11 @@ def parse_args():
     parser.add_argument(
         "--subjects", type=str, nargs='+', default=["sub-01", "sub-02", "sub-05", "sub-07"],
         help="Subject list (e.g., sub-01 sub-02)"
+    )
+    parser.add_argument(
+        "--roi_suffix", type=str, default='schaefer100',
+        choices=['dk', 'destrieux', 'schaefer100', 'schaefer200'],
+        help="ROI atlas suffix (e.g., dk, destrieux, schaefer)"
     )
 
     ###### Model Architecture ######
@@ -112,8 +117,8 @@ def parse_args():
         help="FIR (fMRI-Image Reconstruction) loss weight"
     )
     parser.add_argument(
-        "--ftc_weight", type=float, default=0.5,
-        help="FTC (fMRI-Text Contrastive) loss weight"
+        "--fic_weight", type=float, default=1.0,
+        help="FIC (fMRI-Image Contrastive) loss weight"
     )
     parser.add_argument(
         "--fim_weight", type=float, default=0.1,
@@ -131,7 +136,7 @@ def parse_args():
         help="Optimizer type"
     )
     parser.add_argument(
-        "--max_lr", type=float, default=1e-4, #3e-4에서 내림
+        "--max_lr", type=float, default=1e-4, # 3e-4, 1e-4, 5e-5
         help="Maximum learning rate"
     )
     parser.add_argument(

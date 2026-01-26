@@ -89,9 +89,9 @@ def get_optimizer_with_different_lr(args, model, backbone_lr_scale=0.1):
             'weight_decay': 0.0,
             'lr': args.max_lr
         },
-        # FTC Loss Temperature (full lr - learnable parameter)
+        # FIC Loss Temperature (full lr - learnable parameter)
         {
-            'params': [model.ftc_loss_fn.temp],
+            'params': [model.fic_loss_fn.temp],
             'weight_decay': 0.0,
             'lr': args.max_lr
         },

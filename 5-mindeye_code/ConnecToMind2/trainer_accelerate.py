@@ -57,6 +57,9 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
 
     global_step = 0
 
+    # Curriculum Learning: FIC → FIR 전환 시점 (2/3 지점)
+    fir_start_epoch = args.num_epochs * 2 // 3
+
     if accelerator.is_main_process:
         print(f"\n{'='*60}")
         print(f"Starting Training: {args.experiment_name}")
@@ -64,6 +67,7 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
         print(f"Batch Size (per GPU): {args.batch_size}")
         print(f"Total Batch Size: {args.batch_size * accelerator.num_processes}")
         print(f"Device: {device}")
+        print(f"Curriculum: FIC (epoch 0~{fir_start_epoch-1}) → FIR (epoch {fir_start_epoch}+)")
         print(f"{'='*60}\n")
 
     for epoch in range(args.num_epochs):
@@ -75,14 +79,14 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
         global_step, avg_loss = train_one_epoch(
             args, model, vae, train_loader,
             optimizer, lr_scheduler,
-            epoch, global_step, accelerator
+            epoch, global_step, accelerator, fir_start_epoch
         )
 
         if accelerator.is_main_process:
             print(f"[Epoch {epoch}] Train Loss: {avg_loss:.4f}")
 
         # ============ Validation ============
-        val_loss = validate(args, model, vae, val_loader, accelerator)
+        val_loss = validate(args, model, vae, val_loader, accelerator, epoch, fir_start_epoch)
 
         if accelerator.is_main_process:
             print(f"[Epoch {epoch}] Val Loss: {val_loss:.4f}")
@@ -93,7 +97,7 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
 
         # ============ Evaluation + Metric ============
         # Epoch 0 또는 Epoch 250 이상에서 5 단위
-        should_evaluate = (epoch == 0) or (epoch >= 250 and epoch % 5 == 0)
+        should_evaluate = (epoch == 0) or (epoch % 100 == 0) or (epoch >= 250 and epoch % 5 == 0)
         # should_evaluate = (epoch >= 250 and epoch % 5 == 0)
 
         if should_evaluate:
@@ -227,7 +231,7 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
 # Train Function
 # ============================================================================
 
-def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epoch, global_step, accelerator):
+def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epoch, global_step, accelerator, fir_start_epoch):
     """
     한 epoch 학습 (Accelerate DDP 버전)
 
@@ -235,6 +239,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
         - GradScaler 제거 (Accelerator가 자동 처리)
         - accelerator.backward() 사용
         - autocast() 제거 (Accelerator가 자동 처리)
+    Curriculum: epoch < fir_start_epoch이면 FIC, 이후 FIR
     """
     device = accelerator.device
     model.train()
@@ -264,9 +269,9 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
         # Accelerator가 mixed precision 자동 처리
         outputs = model(fmri, image, device, subject_names=subject_name)
 
-        # Q-Former losses (FIR + FTC + FIM)
+        # Q-Former losses (FIR + FIC + FIM)
         loss_fir = outputs["loss_fir"]
-        loss_ftc = outputs["loss_ftc"]
+        loss_fic = outputs["loss_fic"]
         loss_fim = outputs["loss_fim"]
 
         # ============ Low-level L1 Loss ============
@@ -280,11 +285,17 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 
         loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
 
-        # ============ Total Loss ============
-        loss = (args.fir_weight * loss_fir
-                + args.ftc_weight * loss_ftc
-                + args.fim_weight * loss_fim
-                + args.lowlevel_weight * (loss_l1/0.18215))
+        # ============ Total Loss (Curriculum: FIC → FIR) ============
+        if epoch < fir_start_epoch:
+            # Phase 1: FIC + FIM + Lowlevel (방향 학습)
+            loss = (args.fic_weight * loss_fic
+                    + args.fim_weight * loss_fim
+                    + args.lowlevel_weight * (loss_l1/0.18215))
+        else:
+            # Phase 2: FIR + FIM + Lowlevel (크기 정밀화, FIC 제외)
+            loss = (args.fir_weight * loss_fir
+                    + args.fim_weight * loss_fim
+                    + args.lowlevel_weight * (loss_l1/0.18215))
 
         # ============ Backward ============
         # Accelerator가 scaling + gradient sync 자동 처리
@@ -309,7 +320,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "train/step": current_step,
                 "train/loss": loss.item(),
                 "train/loss_fir": loss_fir.item(),
-                "train/loss_ftc": loss_ftc.item(),
+                "train/loss_fic": loss_fic.item(),
                 "train/loss_fim": loss_fim.item(),
                 "train/loss_l1": loss_l1.item(),
                 "train/lr": lrs_log[-1],
@@ -348,12 +359,12 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "debug/loss_nan": int(torch.isnan(loss).item()),
                 "debug/loss_inf": int(torch.isinf(loss).item()),
                 "debug/loss_fir_nan": int(torch.isnan(loss_fir).item()),
-                "debug/loss_ftc_nan": int(torch.isnan(loss_ftc).item()),
+                "debug/loss_fic_nan": int(torch.isnan(loss_fic).item()),
                 "debug/loss_fim_nan": int(torch.isnan(loss_fim).item()),
                 "debug/loss_l1_nan": int(torch.isnan(loss_l1).item()),
                 "debug/loss_l1_inf": int(torch.isinf(loss_l1).item()),
-                # Temperature (FTC loss)
-                "debug/ftc_temp": model_unwrapped.ftc_loss_fn.temp.item(),
+                # Temperature (FIC loss)
+                "debug/fic_temp": model_unwrapped.fic_loss_fn.temp.item(),
             }
             logs.update(debug_logs)
 
@@ -361,7 +372,7 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 progress_bar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     fir=f"{loss_fir.item():.4f}",
-                    ftc=f"{loss_ftc.item():.4f}",
+                    fic=f"{loss_fic.item():.4f}",
                     fim=f"{loss_fim.item():.4f}",
                     l1=f"{loss_l1.item():.4f}"
                 )
@@ -381,11 +392,12 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 # ============================================================================
 
 @torch.no_grad()
-def validate(args, model, vae, val_loader, accelerator):
+def validate(args, model, vae, val_loader, accelerator, epoch, fir_start_epoch):
     """
     Validation loss 계산 (Accelerate DDP 버전)
 
     모든 프로세스에서 실행 후 샘플 수 기준 가중평균 계산
+    Curriculum: epoch < fir_start_epoch이면 FIC, 이후 FIR
     """
     device = accelerator.device
     model.eval()
@@ -403,7 +415,7 @@ def validate(args, model, vae, val_loader, accelerator):
 
         # Q-Former losses
         loss_fir = outputs["loss_fir"]
-        loss_ftc = outputs["loss_ftc"]
+        loss_fic = outputs["loss_fic"]
         loss_fim = outputs["loss_fim"]
 
         # Low-level L1 Loss (VAE는 float32이므로 변환 필요)
@@ -414,11 +426,17 @@ def validate(args, model, vae, val_loader, accelerator):
         vae_target = vae_target.to(dtype=torch.bfloat16)
         loss_l1 = F.l1_loss(outputs["lowlevel_l1"], vae_target)
 
-        # Total loss
-        loss = (args.fir_weight * loss_fir
-                + args.ftc_weight * loss_ftc
-                + args.fim_weight * loss_fim
-                + args.lowlevel_weight * (loss_l1 / 0.18215))
+        # Total loss (Curriculum: FIC → FIR)
+        if epoch < fir_start_epoch:
+            # Phase 1: FIC + FIM + Lowlevel (방향 학습)
+            loss = (args.fic_weight * loss_fic
+                    + args.fim_weight * loss_fim
+                    + args.lowlevel_weight * (loss_l1 / 0.18215))
+        else:
+            # Phase 2: FIR + FIM + Lowlevel (크기 정밀화, FIC 제외)
+            loss = (args.fir_weight * loss_fir
+                    + args.fim_weight * loss_fim
+                    + args.lowlevel_weight * (loss_l1 / 0.18215))
 
         # 배치 크기로 가중합
         total_loss += loss.item() * batch_size
