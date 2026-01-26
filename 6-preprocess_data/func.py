@@ -7,7 +7,7 @@ def print_npy_shape(path, mmap_mode=None):
     print(f"{path}: type={type(x)}, shape={getattr(x, 'shape', None)}, dtype={getattr(x, 'dtype', None)}")
 
 def print_npz_shape(path):
-    data = np.load(path)
+    data = np.load(path, allow_pickle=True)
     for key in data.files:
         x = data[key]
         print(f"  {key}: type={type(x)}, shape={getattr(x, 'shape', None)}, dtype={getattr(x, 'dtype', None)}")

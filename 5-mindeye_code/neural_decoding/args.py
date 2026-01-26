@@ -69,7 +69,7 @@ def parse_args():
     )
     parser.add_argument(
         "--fmri_detail_dir", type=str, default="connectomind2_v2",
-        choices=["b4_roi_zscore","beta_huggingface","beta_hf_dk","beta_mni","connectomind2_v2","connectomind2","beta_mni_2mm"],
+        choices=["b4_roi_zscore","beta_huggingface","beta_hf_dk","beta_mni","connectomind2_v2","connectomind2","beta_mni_2mm", "beta_mni_1mm", "connectomind1"],
         help="Path to the BIDS fmri_detail."
     )
     parser.add_argument(
