@@ -39,7 +39,7 @@ def parse_args():
 
     ###### DataLoader Settings ######
     parser.add_argument(
-        "--prefetch_factor", type=int, default=10,
+        "--prefetch_factor", type=int, default=5,
         help="prefetch factor for dataloader"
     )
     parser.add_argument(
@@ -110,6 +110,10 @@ def parse_args():
         "--is_fc", action=argparse.BooleanOptionalAction, default=True,
         help="Functional connectivity matrix 사용 유무"
     )
+    parser.add_argument(
+        "--fc_prior_scale", type=float, default=1.0,
+        help="FC prior scaling factor (Fisher r-to-z 변환된 값에 곱함)"
+    )
 
     ###### Loss Weights ######
     parser.add_argument(
@@ -121,7 +125,7 @@ def parse_args():
         help="FIC (fMRI-Image Contrastive) loss weight"
     )
     parser.add_argument(
-        "--fim_weight", type=float, default=0.1,
+        "--fim_weight", type=float, default=0.5,
         help="FIM (matching) loss weight"
     )
     parser.add_argument(
@@ -136,7 +140,7 @@ def parse_args():
         help="Optimizer type"
     )
     parser.add_argument(
-        "--max_lr", type=float, default=1e-4, # 3e-4, 1e-4, 5e-5
+        "--max_lr", type=float, default=3e-4, # 3e-4, 1e-4, 5e-5
         help="Maximum learning rate"
     )
     parser.add_argument(

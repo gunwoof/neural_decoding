@@ -37,16 +37,16 @@ def get_optimizer_with_different_lr(args, model, backbone_lr_scale=0.1):
             'weight_decay': 0.0,
             'lr': args.max_lr
         },
-        # Connectome-QFormer (lower lr - CLIP initialized, excluding fc_prior_scale)
+        # Connectome-QFormer (lower lr - CLIP initialized)
         {
             'params': [p for n, p in model.connectome_qformer.named_parameters()
-                       if not any(nd in n for nd in no_decay) and 'fc_prior_scale' not in n],
+                       if not any(nd in n for nd in no_decay)],
             'weight_decay': args.weight_decay,
             'lr': args.max_lr * backbone_lr_scale
         },
         {
             'params': [p for n, p in model.connectome_qformer.named_parameters()
-                       if any(nd in n for nd in no_decay) and 'fc_prior_scale' not in n],
+                       if any(nd in n for nd in no_decay)],
             'weight_decay': 0.0,
             'lr': args.max_lr * backbone_lr_scale
         },
@@ -92,12 +92,6 @@ def get_optimizer_with_different_lr(args, model, backbone_lr_scale=0.1):
         # FIC Loss Temperature (full lr - learnable parameter)
         {
             'params': [model.fic_loss_fn.temp],
-            'weight_decay': 0.0,
-            'lr': args.max_lr
-        },
-        # FC Prior Scale (full lr - learnable parameter)
-        {
-            'params': [model.connectome_qformer.fc_prior_scale],
             'weight_decay': 0.0,
             'lr': args.max_lr
         },

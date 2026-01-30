@@ -171,8 +171,6 @@ def main():
     if models["versatile_diffusion"] is not None:
         models["versatile_diffusion"] = models["versatile_diffusion"].to(accelerator.device)
 
-    # Test loaders는 DDP 필요 없음 (evaluation은 main process만 수행)
-
     if accelerator.is_main_process:
         print("  Models prepared for distributed training")
         print(f"  Trainable parameters: {sum(p.numel() for p in models['connectomind2'].parameters() if p.requires_grad):,}")

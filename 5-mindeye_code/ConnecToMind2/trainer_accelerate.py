@@ -97,7 +97,7 @@ def train_evaluate_metric(args, train_loader, val_loader, test_loaders, models, 
 
         # ============ Evaluation + Metric ============
         # Epoch 0 또는 Epoch 250 이상에서 5 단위
-        should_evaluate = (epoch == 0) or (epoch % 100 == 0) or (epoch >= 250 and epoch % 5 == 0)
+        should_evaluate = (epoch == 0) or (epoch % 50 == 0) or (epoch >= 250 and epoch % 5 == 0)
         # should_evaluate = (epoch >= 250 and epoch % 5 == 0)
 
         if should_evaluate:
@@ -267,7 +267,8 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
 
         # ============ Forward ============
         # Accelerator가 mixed precision 자동 처리
-        outputs = model(fmri, image, device, subject_names=subject_name)
+        # accelerator 전달: FIC/FIM에서 all_gather 사용 (BLIP-2 공식 방식)
+        outputs = model(fmri, image, device, subject_names=subject_name, accelerator=accelerator)
 
         # Q-Former losses (FIR + FIC + FIM)
         loss_fir = outputs["loss_fir"]
@@ -336,25 +337,40 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "debug/fmri_inf": int(torch.isinf(fmri).any().item()),
                 "debug/fmri_min": fmri.min().item(),
                 "debug/fmri_max": fmri.max().item(),
-                # Output embeddings
+                "debug/fmri_mean": fmri.mean().item(),
+                # Output embeddings (with mean/std)
                 "debug/fmri_proj_nan": int(torch.isnan(outputs["fmri_proj"]).any().item()),
                 "debug/fmri_proj_inf": int(torch.isinf(outputs["fmri_proj"]).any().item()),
                 "debug/fmri_proj_min": outputs["fmri_proj"].min().item(),
                 "debug/fmri_proj_max": outputs["fmri_proj"].max().item(),
+                "debug/fmri_proj_mean": outputs["fmri_proj"].mean().item(),
+                "debug/fmri_proj_std": outputs["fmri_proj"].std().item(),
                 "debug/clip_proj_nan": int(torch.isnan(outputs["clip_proj"]).any().item()),
                 "debug/clip_proj_inf": int(torch.isinf(outputs["clip_proj"]).any().item()),
                 "debug/clip_proj_min": outputs["clip_proj"].min().item(),
                 "debug/clip_proj_max": outputs["clip_proj"].max().item(),
+                "debug/clip_proj_mean": outputs["clip_proj"].mean().item(),
+                "debug/clip_proj_std": outputs["clip_proj"].std().item(),
+                # CLIP vs fMRI comparison
+                "debug/clip_fmri_diff_mean": (outputs["clip_proj"] - outputs["fmri_proj"]).abs().mean().item(),
+                "debug/clip_fmri_diff_std": (outputs["clip_proj"] - outputs["fmri_proj"]).std().item(),
+                "debug/clip_fmri_cosine_sim": F.cosine_similarity(
+                    outputs["clip_proj"].reshape(-1, 768),
+                    outputs["fmri_proj"].reshape(-1, 768),
+                    dim=-1
+                ).mean().item(),
                 # Low-level decoder output
                 "debug/lowlevel_nan": int(torch.isnan(outputs["lowlevel_l1"]).any().item()),
                 "debug/lowlevel_inf": int(torch.isinf(outputs["lowlevel_l1"]).any().item()),
                 "debug/lowlevel_min": outputs["lowlevel_l1"].min().item(),
                 "debug/lowlevel_max": outputs["lowlevel_l1"].max().item(),
+                "debug/lowlevel_mean": outputs["lowlevel_l1"].mean().item(),
                 # VAE target
                 "debug/vae_target_nan": int(torch.isnan(vae_target).any().item()),
                 "debug/vae_target_inf": int(torch.isinf(vae_target).any().item()),
                 "debug/vae_target_min": vae_target.min().item(),
                 "debug/vae_target_max": vae_target.max().item(),
+                "debug/vae_target_mean": vae_target.mean().item(),
                 # Losses
                 "debug/loss_nan": int(torch.isnan(loss).item()),
                 "debug/loss_inf": int(torch.isinf(loss).item()),
@@ -365,6 +381,11 @@ def train_one_epoch(args, model, vae, train_loader, optimizer, lr_scheduler, epo
                 "debug/loss_l1_inf": int(torch.isinf(loss_l1).item()),
                 # Temperature (FIC loss)
                 "debug/fic_temp": model_unwrapped.fic_loss_fn.temp.item(),
+                # FIM classifier weight tracking
+                "debug/fim_weight_mean": model_unwrapped.fim_classifier.weight.data.mean().item(),
+                "debug/fim_weight_std": model_unwrapped.fim_classifier.weight.data.std().item(),
+                "debug/fim_weight_norm": model_unwrapped.fim_classifier.weight.data.norm().item(),
+                "debug/fim_bias_mean": model_unwrapped.fim_classifier.bias.data.mean().item(),
             }
             logs.update(debug_logs)
 
@@ -410,8 +431,8 @@ def validate(args, model, vae, val_loader, accelerator, epoch, fir_start_epoch):
         fmri = fmri.to(device=device, dtype=torch.bfloat16)
         image = image.to(device=device, dtype=torch.bfloat16)
 
-        # Forward
-        outputs = model(fmri, image, device, subject_names=subject_name)
+        # Forward (accelerator 전달: FIC/FIM에서 all_gather 사용)
+        outputs = model(fmri, image, device, subject_names=subject_name, accelerator=accelerator)
 
         # Q-Former losses
         loss_fir = outputs["loss_fir"]

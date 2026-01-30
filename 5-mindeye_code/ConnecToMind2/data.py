@@ -139,7 +139,8 @@ def get_dataloader(args):
             generator=torch.Generator().manual_seed(args.seed)
         )
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
+        # train: drop_last=True - all_gather 시 배치 크기 일치 보장 + 중복 샘플 방지 (BLIP-2 공식 방식)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.num_workers, prefetch_factor=args.prefetch_factor, persistent_workers=True, pin_memory=True, shuffle=False)
         return train_loader, val_loader
 

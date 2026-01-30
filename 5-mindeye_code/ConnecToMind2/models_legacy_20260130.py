@@ -47,7 +47,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-from torch.nn.utils import spectral_norm
 
 from transformers import CLIPVisionModel, CLIPVisionModelWithProjection
 from diffusers import DiffusionPipeline
@@ -230,8 +229,7 @@ class ConnectomeQFormer(nn.Module):
     def __init__(self, hidden_size=768, num_heads=12, num_layers=12,
                  num_query_tokens=100, dropout=0.1, cross_attention_freq=2,
                  clip_model_name="openai/clip-vit-base-patch16",
-                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100',
-                 fc_prior_scale=1.0):
+                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100'):
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -241,8 +239,8 @@ class ConnectomeQFormer(nn.Module):
         self.is_fc = is_fc
         self.num_heads = num_heads
 
-        # FC prior scaling hyperparameter (Fisher r-to-z 변환된 값에 곱함)
-        self.fc_prior_scale = fc_prior_scale
+        # Learnable FC prior scaling parameter (초기값 1.0)
+        self.fc_prior_scale = nn.Parameter(torch.ones(1))
 
         # Cross-attention 적용 여부 미리 계산 (0, 2, 4, ... 번째 layer) - BLIP-2 방식
         self._do_cross_map = [(cross_attention_freq > 0) and (i % cross_attention_freq == 0)
@@ -330,7 +328,6 @@ class ConnectomeQFormer(nn.Module):
         FC prior shape: [100, 100] → Cross-attention mask: [num_heads, 100, 100]
             - 100개 ROI queries에 FC prior 직접 적용
             - num_heads 차원 추가: 모든 head에 동일한 FC prior 적용
-            - Fisher r-to-z 변환 적용: arctanh(r) (대각선은 0으로 설정)
         """
         import numpy as np
 
@@ -344,20 +341,22 @@ class ConnectomeQFormer(nn.Module):
                 print(f"⚠️  FC prior not found: {fc_path}")
                 continue
 
-            # FC prior 로드: [100, 100] (Pearson correlation)
+            # FC prior 로드: [100, 100]
             fc_prior = np.load(fc_path).astype(np.float32)
 
             assert fc_prior.shape[0] == fc_prior.shape[1] == seq_len, \
                 f"FC prior shape mismatch for {sub}: {fc_prior.shape} vs {seq_len}"
 
-            # Fisher r-to-z 변환: arctanh(r)
-            # 대각선(r=1)은 arctanh(1)=inf이므로 0으로 설정
-            np.fill_diagonal(fc_prior, 0)  # 대각선 임시로 0
-            fc_prior = np.clip(fc_prior, -0.9999, 0.9999)  # arctanh 안정성
-            fc_prior_z = np.arctanh(fc_prior)  # Fisher r-to-z 변환
+            # Z-score 정규화 (전체): (fc_prior - mean) / std
+            # 전체 10,000개 값에 대해 하나의 분포로 정규화
+            fc_mean = fc_prior.mean()  # scalar
+            fc_std = fc_prior.std()    # scalar
+            # std가 0이 아닐 때만 정규화
+            if fc_std > 1e-6:
+                fc_prior = (fc_prior - fc_mean) / fc_std
 
-            # Cross-attention mask 생성: [100, 100]
-            mask = torch.from_numpy(fc_prior_z)  # [100, 100]
+            # Cross-attention mask 생성: [100, 100] - FC prior 직접 사용
+            mask = torch.from_numpy(fc_prior)  # [100, 100]
 
             # num_heads만큼 확장: [num_heads, 100, 100]
             # 모든 attention head에 동일한 FC prior 적용
@@ -366,9 +365,7 @@ class ConnectomeQFormer(nn.Module):
             # 저장 (device 이동은 forward 시 수행)
             self.fc_priors[sub] = mask
 
-            print(f"✓ FC prior loaded for {sub}: shape={mask.shape}, "
-                  f"r=[{np.load(fc_path).min():.4f}, {np.load(fc_path).max():.4f}] → "
-                  f"z=[{fc_prior_z.min():.4f}, {fc_prior_z.max():.4f}]")
+            print(f"✓ FC prior loaded for {sub}: shape={mask.shape}, range=[{fc_prior.min():.4f}, {fc_prior.max():.4f}]")
 
         print(f"✅ Total {len(self.fc_priors)} FC priors loaded (pre-expanded for {self.num_heads} heads)")
 
@@ -595,11 +592,11 @@ class FIRLoss(nn.Module):
         Linear layer [B, 257, 768] <------ FIR Loss ------> Linear layer [B, 257, 768]
         (from Q-Former, normalized)                         (from CLIP, normalized)
 
-    L2 Loss (MSE) 사용: L2 normalized embedding 간 거리 측정에 적합
+    L1 Loss 사용: MSE보다 gradient가 안정적 (큰 오차에서도 gradient가 일정)
     """
     def __init__(self):
         super().__init__()
-        self.l2 = nn.MSELoss()
+        self.l1 = nn.L1Loss()
 
     def forward(self, fmri_emb, clip_emb):
         """
@@ -608,26 +605,26 @@ class FIRLoss(nn.Module):
             clip_emb [B, 257, 768] - CLIP output (L2 normalized)
         Output: scalar loss
         """
-        return self.l2(fmri_emb, clip_emb)
+        return self.l1(fmri_emb, clip_emb)
 
 
 class FICLoss(nn.Module):
     """
-    FIC Loss (fMRI-Image Contrastive): BLIP-2 ITC 방식 (All-Gather 지원)
+    FIC Loss (fMRI-Image Contrastive): BLIP-2 ITC 방식
 
     BLIP-2 ITC 구현:
         1. fMRI features (all tokens) vs CLIP features (CLS token) similarity 계산
         2. Max pooling over fMRI tokens (32개 query 중 최대값 선택)
         3. Bidirectional contrastive loss (fMRI→CLIP + CLIP→fMRI)
-        4. All-gather across GPUs (BLIP-2 공식 방식)
+        4. In-batch negatives (단일 GPU 기준)
         5. Temperature scaling (learnable parameter)
         6. Label smoothing (0.1)
 
     Shapes:
         fmri_proj: [B, 257, 768] - fMRI embeddings (all tokens)
         clip_proj: [B, 257, 768] - CLIP embeddings (use CLS token [B, 768])
-        sim_fmri2clip: [B, B*world_size] - fMRI→CLIP similarity (after max pooling)
-        sim_clip2fmri: [B, B*world_size] - CLIP→fMRI similarity (after max pooling)
+        sim_fmri2clip: [B, B] - fMRI→CLIP similarity (after max pooling)
+        sim_clip2fmri: [B, B] - CLIP→fMRI similarity (after max pooling)
     """
     def __init__(self, temperature=0.07, label_smoothing=0.1):
         super().__init__()
@@ -635,80 +632,45 @@ class FICLoss(nn.Module):
         self.temp = nn.Parameter(torch.ones([]) * temperature)
         self.label_smoothing = label_smoothing
 
-    @torch.no_grad()
-    def _gather_features(self, features, accelerator):
-        """
-        Gather features from all GPUs (BLIP-2 concat_all_gather 방식)
-
-        Args:
-            features: [B, ...] - local features
-            accelerator: Accelerator instance
-
-        Returns:
-            all_features: [B*world_size, ...] - gathered features (no gradient)
-        """
-        if accelerator is None or accelerator.num_processes == 1:
-            return features
-
-        # Accelerate의 gather 사용 (all_gather 동작)
-        all_features = accelerator.gather(features.contiguous())
-        return all_features
-
-    def forward(self, fmri_proj, clip_proj, accelerator=None):
+    def forward(self, fmri_proj, clip_proj):
         """
         Input:
             fmri_proj [B, 257, 768] - fMRI embeddings (L2 normalized)
             clip_proj [B, 257, 768] - CLIP embeddings (L2 normalized)
-            accelerator: Accelerator instance (for DDP all_gather)
         Output:
             loss_fic: scalar
-            sim_fmri2clip: [B, B*world_size] - for hard negative mining in FIM
-            sim_clip2fmri: [B, B*world_size] - for hard negative mining in FIM
+            sim_fmri2clip: [B, B] - for hard negative mining in FIM
+            sim_clip2fmri: [B, B] - for hard negative mining in FIM
         """
         B = fmri_proj.size(0)
         device = fmri_proj.device
 
-        # 입력이 이미 L2 normalized 상태 (OutputProjection, CLIPProjector에서 처리됨)
-        fmri_norm = fmri_proj  # [B, 257, 768]
-        clip_cls_norm = clip_proj[:, 0, :]  # [B, 768] - CLS only
+        # Normalize features
+        fmri_norm = F.normalize(fmri_proj, dim=-1)  # [B, 257, 768]
+        clip_cls_norm = F.normalize(clip_proj[:, 0, :], dim=-1)  # [B, 768] - CLS only
 
-        # ============ All-Gather (BLIP-2 방식) ============
-        # Gather features from all GPUs (no gradient for gathered tensors)
-        fmri_norm_all = self._gather_features(fmri_norm, accelerator)  # [B*world_size, 257, 768]
-        clip_cls_all = self._gather_features(clip_cls_norm, accelerator)  # [B*world_size, 768]
+        # Compute similarity: fMRI (all tokens) vs CLIP (CLS)
+        # einsum: 'bid,cd->bic' where b=fmri_batch, i=fmri_tokens, d=dim, c=clip_batch
+        sim_q2t = torch.einsum('bid,cd->bic', fmri_norm, clip_cls_norm)
+        # [B, 257, B] - (i-th fmri's each token) vs (all clip CLS)
 
-        # Get rank for correct target indices
-        if accelerator is not None and accelerator.num_processes > 1:
-            rank = accelerator.process_index
-            world_size = accelerator.num_processes
-        else:
-            rank = 0
-            world_size = 1
+        # Max over fmri tokens: [B, 257, B] -> [B, B]
+        sim_fmri2clip, _ = sim_q2t.max(dim=1)  # [B, B]
 
-        # ============ Compute Similarity ============
-        # fMRI (local) vs CLIP (all GPUs)
-        # einsum: 'bid,cd->bic' where b=local_batch, i=tokens, d=dim, c=all_batch
-        sim_q2t = torch.einsum('bid,cd->bic', fmri_norm, clip_cls_all)
-        # [B, 257, B*world_size]
+        # Symmetric: CLIP (CLS) vs fMRI (all tokens)
+        # einsum: 'bd,cid->bci' where b=clip_batch, d=dim, c=fmri_batch, i=fmri_tokens
+        sim_t2q = torch.einsum('bd,cid->bci', clip_cls_norm, fmri_norm)
+        # [B, B, 257] - (i-th clip CLS) vs (all fmri's each token)
 
-        # Max over fmri tokens: [B, 257, B*world_size] -> [B, B*world_size]
-        sim_fmri2clip, _ = sim_q2t.max(dim=1)  # [B, B*world_size]
-
-        # Symmetric: CLIP (local) vs fMRI (all GPUs)
-        # einsum: 'bd,cid->bci' where b=local_batch, d=dim, c=all_batch, i=tokens
-        sim_t2q = torch.einsum('bd,cid->bci', clip_cls_norm, fmri_norm_all)
-        # [B, B*world_size, 257]
-
-        # Max over fmri tokens: [B, B*world_size, 257] -> [B, B*world_size]
-        sim_clip2fmri, _ = sim_t2q.max(dim=-1)  # [B, B*world_size]
+        # Max over fmri tokens: [B, B, 257] -> [B, B]
+        sim_clip2fmri, _ = sim_t2q.max(dim=-1)  # [B, B]
 
         # Temperature scaling (learnable)
         sim_fmri2clip = sim_fmri2clip / self.temp
         sim_clip2fmri = sim_clip2fmri / self.temp
 
-        # ============ Targets with rank offset (BLIP-2 방식) ============
-        # 각 GPU의 positive는 rank*B + local_idx 위치에 있음
-        targets = torch.arange(B, device=device, dtype=torch.long) + rank * B
+        # Targets: diagonal (positive pairs)
+        targets = torch.arange(B, device=device, dtype=torch.long)
 
         # Bidirectional contrastive loss (BLIP-2 ITC style)
         loss_fic = (
@@ -723,26 +685,24 @@ class FIMLoss(nn.Module):
     """
     FIM Loss (fMRI-Image Matching): BLIP-2 ITM 방식 with Hard Negative Mining
 
-    BLIP-2 ITM 구현 (negative_all_rank=True 방식):
-        1. fmri_emb, clip_proj를 all-gather하여 전체 GPU 데이터 수집
-        2. 전체 similarity에서 hard negative sampling (자기 positive만 mask)
-        3. all-gather된 데이터에서 negative 가져오기
-        4. 3B triplet 구성: (pos+pos, pos+neg_clip, neg_fmri+pos)
-        5. Q-Former forward with 3B samples (use_mask=False)
-        6. Binary classification (match=1, not match=0)
+    BLIP-2 ITM 구현:
+        1. ITC similarity를 사용하여 hard negative sampling
+        2. 3B triplet 구성: (pos+pos, pos+neg_clip, neg_fmri+pos)
+        3. Q-Former forward with 3B samples (use_mask=False)
+        4. OutputProjection으로 [257, 768]로 변환 (FIC/FIR과 일관성)
+        5. Binary classification (match=1, not match=0)
+        6. All query tokens 사용 + mean pooling
 
-    Hard Negative Mining (BLIP 공식 negative_all_rank=True 방식):
-        - 전체 similarity matrix 사용 [B, B*world_size]
-        - 자기 positive (rank*B + local_idx)만 mask
+    Hard Negative Mining:
+        - sim_fmri2clip, sim_clip2fmri에서 diagonal 제외
         - Softmax로 확률 분포 변환
-        - torch.multinomial로 전체에서 hard negative sampling
-        - all-gather된 데이터에서 negative 가져오기
+        - torch.multinomial로 hard negative sampling
 
     Shapes:
         fmri_emb: [B, 100, 768] - Region-level embeddings
         clip_proj: [B, 257, 768] - CLIP embeddings
-        sim_fmri2clip: [B, B*world_size] - fMRI→CLIP similarity (from FIC, all_gathered)
-        sim_clip2fmri: [B, B*world_size] - CLIP→fMRI similarity (from FIC, all_gathered)
+        sim_fmri2clip: [B, B] - fMRI→CLIP similarity (from FIC)
+        sim_clip2fmri: [B, B] - CLIP→fMRI similarity (from FIC)
         Output: scalar loss
     """
     def __init__(self):
@@ -750,118 +710,67 @@ class FIMLoss(nn.Module):
         # 모듈을 저장하지 않음 - 중복 등록으로 인한 gradient 문제 방지
         # qformer, fim_classifier, output_proj는 forward에서 인자로 받음
 
-    @torch.no_grad()
-    def _gather_features(self, features, accelerator):
-        """
-        Gather features from all GPUs (BLIP negative_all_rank 방식)
-
-        Args:
-            features: [B, ...] - local features
-            accelerator: Accelerator instance
-
-        Returns:
-            all_features: [B*world_size, ...] - gathered features (no gradient)
-        """
-        if accelerator is None or accelerator.num_processes == 1:
-            return features
-
-        # Accelerate의 gather 사용 (all_gather 동작)
-        all_features = accelerator.gather(features.contiguous())
-        return all_features
-
     def forward(self, fmri_emb, clip_proj, sim_fmri2clip, sim_clip2fmri,
-                qformer, fim_classifier, output_proj, subject_names=None, accelerator=None):
+                qformer, fim_classifier, output_proj, subject_names=None):
         """
         Input:
             fmri_emb [B, 100, 768] - Region-level embeddings
             clip_proj [B, 257, 768] - CLIP embeddings
-            sim_fmri2clip [B, B*world_size] - fMRI→CLIP similarity (from FIC, all_gathered)
-            sim_clip2fmri [B, B*world_size] - CLIP→fMRI similarity (from FIC, all_gathered)
+            sim_fmri2clip [B, B] - fMRI→CLIP similarity (from FIC)
+            sim_clip2fmri [B, B] - CLIP→fMRI similarity (from FIC)
             qformer: ConnectomeQFormer 모듈 (외부에서 전달)
             fim_classifier: nn.Linear 모듈 (외부에서 전달)
             output_proj: OutputProjection 모듈 (외부에서 전달)
             subject_names: list of subject names [B] (for FC prior)
-            accelerator: Accelerator instance (for DDP all_gather)
         Output:
             loss_fim: scalar
         """
         B = fmri_emb.size(0)
         device = fmri_emb.device
 
-        # Get rank info
-        if accelerator is not None and accelerator.num_processes > 1:
-            rank = accelerator.process_index
-            world_size = accelerator.num_processes
-        else:
-            rank = 0
-            world_size = 1
-
-        # ============ All-gather embeddings (BLIP negative_all_rank=True) ============
-        # 모든 GPU의 데이터를 수집하여 전체에서 hard negative 선택
-        fmri_emb_world = self._gather_features(fmri_emb, accelerator)  # [B*world_size, 100, 768]
-        clip_proj_world = self._gather_features(clip_proj, accelerator)  # [B*world_size, 257, 768]
-
-        # Subject names도 all-gather (string list는 수동으로)
-        if subject_names is not None and accelerator is not None and accelerator.num_processes > 1:
-            import itertools
-            all_subject_names = accelerator.gather_for_metrics(subject_names)
-            # gather_for_metrics returns nested list, flatten it
-            if isinstance(all_subject_names[0], list):
-                subject_names_world = list(itertools.chain.from_iterable(all_subject_names))
-            else:
-                subject_names_world = all_subject_names
-        else:
-            subject_names_world = subject_names
-
-        B_world = fmri_emb_world.size(0)  # B * world_size
-
-        # Step 1: Hard negative mining from ALL GPUs (BLIP negative_all_rank=True)
+        # Step 1: Hard negative mining (BLIP-2 style: within torch.no_grad)
         with torch.no_grad():
-            # 전체 similarity 사용 [B, B*world_size]
+            # Mask diagonal (positive pairs)
             sim_fmri2clip_neg = sim_fmri2clip.clone()
             sim_clip2fmri_neg = sim_clip2fmri.clone()
+            sim_fmri2clip_neg.fill_diagonal_(-10000)
+            sim_clip2fmri_neg.fill_diagonal_(-10000)
 
-            # 자기 positive만 mask (rank*B + local_idx 위치)
-            for b in range(B):
-                pos_idx = rank * B + b  # 전체 matrix에서 자기 positive 위치
-                sim_fmri2clip_neg[b, pos_idx] = -10000
-                sim_clip2fmri_neg[b, pos_idx] = -10000
+            # Softmax to get sampling weights
+            weights_fmri2clip = F.softmax(sim_fmri2clip_neg, dim=1)  # [B, B]
+            weights_clip2fmri = F.softmax(sim_clip2fmri_neg, dim=1)  # [B, B]
 
-            # Softmax to get sampling weights (전체 B*world_size에서)
-            weights_fmri2clip = F.softmax(sim_fmri2clip_neg, dim=1)  # [B, B*world_size]
-            weights_clip2fmri = F.softmax(sim_clip2fmri_neg, dim=1)  # [B, B*world_size]
-
-        # Step 2: Sample hard negatives from ALL GPUs
-        # Hard negative clip for each fmri (전체에서 선택)
+        # Step 2: Sample hard negatives with torch.multinomial
+        # Hard negative clip for each fmri
         clip_neg_indices = []
         for b in range(B):
             neg_idx = torch.multinomial(weights_fmri2clip[b], 1).item()
             clip_neg_indices.append(neg_idx)
         clip_neg_indices = torch.tensor(clip_neg_indices, device=device, dtype=torch.long)
-        clip_proj_neg = clip_proj_world[clip_neg_indices]  # [B, 257, 768] - 전체에서 가져옴
+        clip_proj_neg = clip_proj[clip_neg_indices]  # [B, 257, 768]
 
-        # Hard negative fmri for each clip (전체에서 선택)
+        # Hard negative fmri for each clip
         fmri_neg_indices = []
         for b in range(B):
             neg_idx = torch.multinomial(weights_clip2fmri[b], 1).item()
             fmri_neg_indices.append(neg_idx)
         fmri_neg_indices = torch.tensor(fmri_neg_indices, device=device, dtype=torch.long)
-        fmri_emb_neg = fmri_emb_world[fmri_neg_indices]  # [B, 100, 768] - 전체에서 가져옴
+        fmri_emb_neg = fmri_emb[fmri_neg_indices]  # [B, 100, 768]
 
-        # Step 3: Construct 3B samples (BLIP-2 triplet style)
+        # Step 4: Construct 3B samples (BLIP-2 triplet style)
         # 1) fmri(pos) + clip(pos)  → matched (label=1)
         # 2) fmri(pos) + clip(neg)  → unmatched (label=0)
         # 3) fmri(neg) + clip(pos)  → unmatched (label=0)
         fmri_emb_3b = torch.cat([
-            fmri_emb,      # [B, 100, 768] - positive (로컬)
-            fmri_emb,      # [B, 100, 768] - positive (로컬, for negative clip)
-            fmri_emb_neg,  # [B, 100, 768] - negative fmri (전체에서 선택됨)
+            fmri_emb,      # [B, 100, 768] - positive
+            fmri_emb,      # [B, 100, 768] - positive (for negative clip)
+            fmri_emb_neg,  # [B, 100, 768] - negative fmri
         ], dim=0)  # [3B, 100, 768]
 
         clip_proj_3b = torch.cat([
-            clip_proj,      # [B, 257, 768] - positive (로컬)
-            clip_proj_neg,  # [B, 257, 768] - negative clip (전체에서 선택됨)
-            clip_proj,      # [B, 257, 768] - positive (로컬, for negative fmri)
+            clip_proj,      # [B, 257, 768] - positive
+            clip_proj_neg,  # [B, 257, 768] - negative clip
+            clip_proj,      # [B, 257, 768] - positive (for negative fmri)
         ], dim=0)  # [3B, 257, 768]
 
         fim_labels = torch.cat([
@@ -869,22 +778,22 @@ class FIMLoss(nn.Module):
             torch.zeros(2 * B, device=device),  # [2B] - unmatched
         ], dim=0)  # [3B]
 
-        # Subject names 3배로 복제 (negative는 전체에서 가져옴)
-        if subject_names is not None and subject_names_world is not None:
-            subject_names_neg = [subject_names_world[i] for i in fmri_neg_indices.cpu().tolist()]
+        # Subject names 3배로 복제
+        if subject_names is not None:
+            subject_names_neg = [subject_names[i] for i in fmri_neg_indices.cpu().tolist()]
             subject_names_3b = subject_names + subject_names + subject_names_neg
         else:
             subject_names_3b = None
 
-        # Step 4: Q-Former forward with 3B samples (use_mask=False)
+        # Step 5: Q-Former forward with 3B samples (use_mask=False)
         qformer_out_fim = qformer(
             fmri_emb_3b, clip_proj_3b, use_mask=False, subject_names=subject_names_3b
         )  # [3B, 100, 768]
 
-        # Step 5: OutputProjection으로 [257, 768]로 변환 (normalized)
+        # Step 6: OutputProjection으로 [257, 768]로 변환 (normalized)
         fmri_proj_fim = output_proj(qformer_out_fim)  # [3B, 257, 768]
 
-        # Step 6: Binary classification (BLIP-2 ITM style)
+        # Step 7: Binary classification (BLIP-2 ITM style)
         vl_output = fim_classifier(fmri_proj_fim)  # [3B, 257, 2] - 각 token에서 2-class
         fim_logits = vl_output.mean(dim=1)  # [3B, 2] - 모든 token 평균화
 
@@ -946,8 +855,7 @@ class ConnecToMind2(nn.Module):
     """
     def __init__(self, seq_len=100, input_dim=3291, embed_dim=768,
                  num_qformer_layers=12, num_query_tokens=100,
-                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100',
-                 fc_prior_scale=1.0):
+                 is_fc=False, subjects=None, fc_base_dir=None, roi_suffix='schaefer100'):
         super().__init__()
 
         self.seq_len = seq_len
@@ -974,8 +882,7 @@ class ConnecToMind2(nn.Module):
             is_fc=is_fc,
             subjects=subjects,
             fc_base_dir=fc_base_dir,
-            roi_suffix=roi_suffix,
-            fc_prior_scale=fc_prior_scale
+            roi_suffix=roi_suffix
         )
 
         # 4. Output Projection: [B, 100, 768] -> [B, 257, 768]
@@ -989,27 +896,25 @@ class ConnecToMind2(nn.Module):
         self.low_level_decoder = LowLevelDecoder(seq_len=seq_len, embed_dim=embed_dim)
 
         # 6. FIM classifier (BLIP-2 ITM Style): 모든 query [768] -> 2-class logit [2]
-        # Spectral Norm 적용: weight의 spectral norm을 1로 제한하여 학습 안정화
-        self.fim_classifier = spectral_norm(nn.Linear(embed_dim, 2))
+        self.fim_classifier = nn.Linear(embed_dim, 2)
 
         # 7. Loss functions
         self.fir_loss_fn = FIRLoss()
         self.fic_loss_fn = FICLoss(temperature=0.07, label_smoothing=0.1)
         self.fim_loss_fn = FIMLoss()  # 모듈은 forward에서 인자로 전달
 
-    def forward(self, fmri, images, device, subject_names=None, accelerator=None):
+    def forward(self, fmri, images, device, subject_names=None):
         """
         Training forward (Q-Former 2번 호출: FIR용 마스크 O, FIM용 마스크 X)
 
         FIR: Q-T 상호 차단 마스크 사용 (Query가 CLIP을 직접 보면 cheating)
         FIC: ITC 기반 contrastive learning (fMRI-CLIP alignment)
-             All-gather across GPUs (BLIP-2 공식 방식)
         FIM: 마스크 없음 (Query가 CLIP을 보고 matching 판단)
              Hard Negative Mining + 3B samples (BLIP-2 ITM 공식 방식)
 
         Loss Classes:
-            - FIRLoss: L2 loss (fmri_proj vs clip_proj)
-            - FICLoss: Bidirectional contrastive loss (ITC 방식, all_gather)
+            - FIRLoss: L1 loss (fmri_proj vs clip_proj)
+            - FICLoss: Bidirectional contrastive loss (ITC 방식)
             - FIMLoss: Binary classification with hard negative mining (ITM 방식)
 
         Input:
@@ -1017,7 +922,6 @@ class ConnecToMind2(nn.Module):
             images [B, 3, 224, 224]
             device: torch device
             subject_names: list of subject names [B] (for FC prior)
-            accelerator: Accelerator instance (for DDP all_gather)
 
         Output: dict
             fmri_proj: [B, 257, 768] - for FIR loss
@@ -1045,8 +949,8 @@ class ConnecToMind2(nn.Module):
         # 1. FIR Loss (L1) - normalized 값 사용 (방향만 학습)
         loss_fir = self.fir_loss_fn(fmri_proj, clip_proj)
 
-        # 2. FIC Loss (ITC-based Contrastive) - all_gather across GPUs (BLIP-2 공식 방식)
-        loss_fic, sim_fmri2clip, sim_clip2fmri = self.fic_loss_fn(fmri_proj, clip_proj, accelerator=accelerator)
+        # 2. FIC Loss (ITC-based Contrastive) - normalized 값 사용 (방향/cosine similarity)
+        loss_fic, sim_fmri2clip, sim_clip2fmri = self.fic_loss_fn(fmri_proj, clip_proj)
 
         # 3. FIM Loss (ITM with Hard Negative Mining)
         loss_fim = self.fim_loss_fn(
@@ -1054,8 +958,7 @@ class ConnecToMind2(nn.Module):
             qformer=self.connectome_qformer,
             fim_classifier=self.fim_classifier,
             output_proj=self.output_proj,
-            subject_names=subject_names,
-            accelerator=accelerator
+            subject_names=subject_names
         )
 
         # 4. Low-level decoder (원본 fmri_emb만 사용)
@@ -1136,7 +1039,6 @@ def get_model(args):
         subjects=args.subjects,
         fc_base_dir=fc_base_dir,
         roi_suffix=args.roi_suffix,
-        fc_prior_scale=args.fc_prior_scale,
     )
 
     # High-level reconstruction 용도 -> Versatile Diffusion pipeline

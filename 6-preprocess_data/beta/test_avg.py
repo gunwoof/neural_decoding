@@ -5,11 +5,11 @@ from pathlib import Path
 # =========================
 # inputs
 # =========================
-SUB = "sub-05"
-base_dir = Path("/nas/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm") / SUB
-tsv_path = base_dir / f"{SUB}_beta_test.tsv"
+SUB = "sub-02"
+base_dir = Path("/research/wsi/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/connectomind2") / SUB
+tsv_path = Path("/research/wsi/research/03-Neural_decoding/3-bids/2-derivatives/1-beta/beta_mni_2mm") / SUB / f"{SUB}_beta_test.tsv"
 
-schaefer_list = list(range(100, 401, 100))  
+vosdewael_list = list(range(100, 401, 100))  
 
 # =========================
 # helper: parse coco num
@@ -46,14 +46,10 @@ G = T // 3
 print(f"[INFO] TSV lines={T}, unique groups={G}")
 
 # =========================
-# per-schaefer: reorder-on-the-fly -> avg only
+# per-vosdewael: reorder-on-the-fly -> avg only
 # =========================
-def process_schaefer(n: int, chunk_groups: int = 8):
-    """
-    chunk_groups: 한 번에 처리할 'group(=3개)' 개수.
-      예) 8이면 8*3=24 trial씩 한 번에 로드/평균
-    """
-    npy_path = base_dir / f"{SUB}_beta_test_vosdewael{n}_T.npy"
+def process_vosdewael(n: int, chunk_groups: int = 8):
+    npy_path = base_dir / f"{SUB}_beta-test_vosdewael{n}_3000.npy"
     if not npy_path.exists():
         print(f"[SKIP] missing: {npy_path}")
         return
@@ -63,7 +59,7 @@ def process_schaefer(n: int, chunk_groups: int = 8):
         raise ValueError(f"[vosdewael{n}] npy first dim {beta.shape[0]} != tsv lines {T}")
 
     _, P, V = beta.shape
-    out_npy_avg = Path(npy_path.with_suffix("").as_posix() + "_avg.npy")
+    out_npy_avg = base_dir / f"{SUB}_beta-test_vosdewael{n}.npy"
 
     print(f"[INFO] vosdewael{n}: beta shape={beta.shape} -> avg shape=({G},{P},{V})")
 
@@ -88,7 +84,7 @@ def process_schaefer(n: int, chunk_groups: int = 8):
     del beta_avg_mm  # flush
     print(f"[OK] vosdewael{n}: wrote avg npy: {out_npy_avg}")
 
-for n in schaefer_list:
-    process_schaefer(n)
+for n in vosdewael_list:
+    process_vosdewael(n)
 
 print("[DONE] avg-only for vosdewael100~400 (missing ones skipped).")

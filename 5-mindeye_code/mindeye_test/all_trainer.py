@@ -18,6 +18,9 @@ from torchvision.utils import save_image
 from utils import img_augment_high, img_augment_low, mixup, mixco_nce_loss, cosine_anneal, soft_clip_loss, topk, batchwise_cosine_similarity, log_gradient_norms, check_nan_and_log, reconstruction, plot_best_vs_gt_images, save_gt_vs_recon_images, get_unique_path, soft_cont_loss
 
 def high_train_inference_evaluate(args, train_data, test_data, models, optimizer, lr_scheduler, metrics):
+    """
+    test_data: DataLoader 또는 [(name, DataLoader), ...] 리스트
+    """
     
     # train argument
     device = args.device
@@ -166,147 +169,167 @@ def high_train_inference_evaluate(args, train_data, test_data, models, optimizer
         torch.cuda.empty_cache() # gpu 메모리 cache삭제
         gc.collect() # # gpu 메모리 안 쓰는거 삭제
 
-        # if epoch == 0 or (epoch >= 250 and epoch % 10 == 0):
-        if epoch >= 250 and epoch % 10 == 0:
-            
-            #### inference ####
-            all_recons = []
-            all_targets = []
-            save_recons = {}
-            best_clip_score = 0.0  
+        if (epoch == 0) or (epoch >= 250 and epoch % 10 == 0):
+        # if (epoch >= 250 and epoch % 10 == 0):
 
-            diffusion_prior.eval()
-            progress_bar = tqdm(enumerate(test_data), total=len(test_data), ncols=120)
-            for index, (fmri_vol, image, low_image, image_id) in progress_bar: # enumerate: index와 값을 같이 반환
-                with torch.inference_mode():
-                    # noise 난수 고정
-                    generator = torch.Generator(device=device)
-                    generator.manual_seed(seed)
+            # test_data가 리스트인지 확인 (여러 test set)
+            if isinstance(test_data, list):
+                test_data_list = test_data
+            else:
+                test_data_list = [("default", test_data)]
 
-                    # data + gpu 올리기
-                    fmri_vol = fmri_vol.to(device)   # fMRI -> GPU
-                    image = image.to(device)         # Image -> GPU
-                    low_image = low_image.to(device) 
-                    
-                    #### forward inference ####
-                    # forward(MLP backbone) 
-                    clip_voxels, clip_voxels_proj = diffusion_prior.voxel2clip(fmri_vol)
-                    clip_voxels = clip_voxels.view(len(fmri_vol),-1,clip_size) # [B, (257 * 768)] -> [B, 257, 768]
+            # 각 test set에 대해 inference + evaluate
+            for test_name, test_loader in test_data_list:
+                print(f"\n{'='*80}")
+                print(f"Evaluating on test set: {test_name}")
+                print(f"{'='*80}\n")
 
-                    proj_embeddings = clip_voxels_proj.cpu() # pick 할 때만 사용되어서 cpu로 내림
+                #### inference ####
+                all_recons = []
+                all_targets = []
+                save_recons = {}
 
-                    # forward(diffusion prior) 
-                    clip_voxels = clip_voxels.repeat_interleave(recons_per_sample, dim=0) # [B×(recons_per_sample), 257, 768] -> ex) 1번,1번,1번,2번,2번,2번,...
-                    # diffusion prior 결과
-                    brain_clip_embeddings = diffusion_prior.p_sample_loop(clip_voxels.shape, 
-                                            text_cond = dict(text_embed = clip_voxels), 
-                                            cond_scale = 1., generator=generator) 
+                diffusion_prior.eval()
+                progress_bar = tqdm(enumerate(test_loader), total=len(test_loader), ncols=120, desc=f"Inference [{test_name}]")
+                for index, (fmri_vol, image, low_image, image_id) in progress_bar: # enumerate: index와 값을 같이 반환
+                    with torch.inference_mode():
+                        # noise 난수 고정
+                        generator = torch.Generator(device=device)
+                        generator.manual_seed(seed)
 
-                    # forward(versatile diffusion) 
-                    _, _, _, best_img = reconstruction(
-                        brain_clip_embeddings, proj_embeddings, image,
-                        clip_extractor, unet, vae, noise_scheduler,
-                        seed,
-                        device,
-                        num_inference_steps,
-                        recons_per_sample, # mindeye에서는 16개
-                        inference_batch_size=fmri_vol.shape[0], # batch 중에서 몇 개만 저장할지 -> inference batch와 같이 줄 것
-                        img_lowlevel = low_image,
-                        guidance_scale = 3.5,
-                        img2img_strength = .85,
-                        plotting=False,
-                    )
+                        # data + gpu 올리기
+                        fmri_vol = fmri_vol.to(device)   # fMRI -> GPU
+                        image = image.to(device)         # Image -> GPU
+                        low_image = low_image.to(device)
 
-                    # image를 실제로 저장하기 위해 dictionary에 담아둠
-                    image = image.cpu()
-                    for i in range(len(image_id)):
-                        img_id = image_id[i] 
-                        recon_img = best_img[i]
-                        gt_img = image[i]
-                        save_recons[img_id] = (recon_img, gt_img)
+                        #### forward inference ####
+                        # forward(MLP backbone)
+                        clip_voxels, clip_voxels_proj = diffusion_prior.voxel2clip(fmri_vol)
+                        clip_voxels = clip_voxels.view(len(fmri_vol),-1,clip_size) # [B, (257 * 768)] -> [B, 257, 768]
 
-                    # metric을 위해 저장
-                    all_recons.append(best_img)       # 이미 CPU 상태
-                    all_targets.append(image.cpu())        # image를 GPU에서 내려야 함 (image는 아직 GPU)
+                        proj_embeddings = clip_voxels_proj.cpu() # pick 할 때만 사용되어서 cpu로 내림
 
-            all_recons = torch.cat(all_recons, dim=0)  # [N, 3, H, W]
-            all_targets = torch.cat(all_targets, dim=0)
+                        # forward(diffusion prior)
+                        clip_voxels = clip_voxels.repeat_interleave(recons_per_sample, dim=0) # [B×(recons_per_sample), 257, 768] -> ex) 1번,1번,1번,2번,2번,2번,...
+                        # diffusion prior 결과
+                        brain_clip_embeddings = diffusion_prior.p_sample_loop(clip_voxels.shape,
+                                                text_cond = dict(text_embed = clip_voxels),
+                                                cond_scale = 1., generator=generator)
 
-            torch.cuda.empty_cache() # gpu 메모리 cache삭제
-            gc.collect() # gpu 메모리 안 쓰는거 삭제
+                        # forward(versatile diffusion)
+                        _, _, _, best_img = reconstruction(
+                            brain_clip_embeddings, proj_embeddings, image,
+                            clip_extractor, unet, vae, noise_scheduler,
+                            seed,
+                            device,
+                            num_inference_steps,
+                            recons_per_sample, # mindeye에서는 16개
+                            inference_batch_size=fmri_vol.shape[0], # batch 중에서 몇 개만 저장할지 -> inference batch와 같이 줄 것
+                            img_lowlevel = low_image,
+                            guidance_scale = 3.5,
+                            img2img_strength = .85,
+                            plotting=False,
+                        )
 
-            #### evaluate ####
-            results = {}
+                        # image를 실제로 저장하기 위해 dictionary에 담아둠 (메모리 절약: 최대 100개만)
+                        image = image.cpu()
+                        for i in range(len(image_id)):
+                            if len(save_recons) >= 100:  # 메모리 제한
+                                break
+                            img_id = image_id[i]
+                            recon_img = best_img[i]
+                            gt_img = image[i]
+                            save_recons[img_id] = (recon_img, gt_img)
 
-            # PixCorr / SSIM
-            results["PixCorr"] = metrics["pixcorr"](all_recons, all_targets)
-            results["SSIM"] = metrics["ssim"](all_recons, all_targets)
+                        # metric을 위해 저장
+                        all_recons.append(best_img)       # 이미 CPU 상태
+                        all_targets.append(image.cpu())        # image를 GPU에서 내려야 함 (image는 아직 GPU)
 
-            # AlexNet
-            results["AlexNet_2"] = metrics["alexnet2"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["alexnet2"]["model"],
-                metrics["alexnet2"]["preprocess"],
-                metrics["alexnet2"]["layer"]
-            )
+                all_recons = torch.cat(all_recons, dim=0)  # [N, 3, H, W]
+                all_targets = torch.cat(all_targets, dim=0)
 
-            results["AlexNet_5"] = metrics["alexnet5"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["alexnet5"]["model"],
-                metrics["alexnet5"]["preprocess"],
-                metrics["alexnet5"]["layer"]
-            )
+                torch.cuda.empty_cache() # gpu 메모리 cache삭제
+                gc.collect() # gpu 메모리 안 쓰는거 삭제
 
-            # CLIP / Inception / EfficientNet / SwAV
-            results["CLIP"] = metrics["clip"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["clip"]["model"],
-                metrics["clip"]["preprocess"]
-            )
+                #### evaluate ####
+                results = {}
 
-            results["Inception"] = metrics["inception"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["inception"]["model"],
-                metrics["inception"]["preprocess"]
-            )
+                # PixCorr / SSIM
+                results["PixCorr"] = metrics["pixcorr"](all_recons, all_targets)
+                results["SSIM"] = metrics["ssim"](all_recons, all_targets)
 
-            results["EfficientNet_B1"] = metrics["efficientnet"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["efficientnet"]["model"],
-                metrics["efficientnet"]["preprocess"]
-            )
+                # AlexNet
+                results["AlexNet_2"] = metrics["alexnet2"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["alexnet2"]["model"],
+                    metrics["alexnet2"]["preprocess"],
+                    metrics["alexnet2"]["layer"]
+                )
 
-            results["SwAV"] = metrics["swav"]["metric_fn"](
-                args, all_recons, all_targets,
-                metrics["swav"]["model"],
-                metrics["swav"]["preprocess"]
-            )
-            
-            for name, score in results.items():
-                print(f"{name:12}: {score:.4f}")
-            wandb.log({f"eval/epoch{epoch}_{k}": v for k, v in results.items()}, step=global_step)
+                results["AlexNet_5"] = metrics["alexnet5"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["alexnet5"]["model"],
+                    metrics["alexnet5"]["preprocess"],
+                    metrics["alexnet5"]["layer"]
+                )
 
+                # CLIP / Inception / EfficientNet / SwAV
+                results["CLIP"] = metrics["clip"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["clip"]["model"],
+                    metrics["clip"]["preprocess"]
+                )
 
+                results["Inception"] = metrics["inception"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["inception"]["model"],
+                    metrics["inception"]["preprocess"]
+                )
 
-            # CLIP_2이 0.9 이상이면 모델 저장
-            save_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, f"mindeye1_{epoch}_{experiment_name}.pt")
-            save_path = get_unique_path(save_path)
-            torch.save(diffusion_prior.state_dict(), save_path)
-            print(f"Final model saved to {save_path} (metric > 0.9)")
+                results["EfficientNet_B1"] = metrics["efficientnet"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["efficientnet"]["model"],
+                    metrics["efficientnet"]["preprocess"]
+                )
 
-            # save_recons 저장
-            recons_dir = os.path.join(args.root_dir, args.code_dir, args.output_dir, "recons_test")
-            save_gt_vs_recon_images(save_recons, recons_dir)
+                results["SwAV"] = metrics["swav"]["metric_fn"](
+                    args, all_recons, all_targets,
+                    metrics["swav"]["model"],
+                    metrics["swav"]["preprocess"]
+                )
 
-            # 결과를 텍스트 파일로 저장
-            result_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, f"mindeye1_metrics_{epoch}_{experiment_name}.txt")
-            result_path = get_unique_path(result_path)
-            with open(result_path, "w") as f:
+                print(f"\n[{test_name}] Evaluation Results:")
                 for name, score in results.items():
-                    f.write(f"{name}: {score:.4f}\n")
+                    print(f"  {name:20}: {score:.4f}")
+                wandb.log({f"eval/{test_name}/epoch{epoch}_{k}": v for k, v in results.items()}, step=global_step)
 
-            torch.cuda.empty_cache() # gpu 메모리 cache삭제
-            gc.collect() # gpu 메모리 안 쓰는거 삭제
+                # 모델 저장 (첫 번째 test set 기준)
+                if test_name == test_data_list[0][0]:  # 첫 번째 test set만
+                    save_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, f"mindeye1_{epoch}_{experiment_name}.pt")
+                    save_path = get_unique_path(save_path)
+                    torch.save(diffusion_prior.state_dict(), save_path)
+                    print(f"\nModel saved to {save_path}")
+
+                # save_recons 저장
+                recons_dir = os.path.join(args.root_dir, args.code_dir, args.output_dir, f"recons_test_{test_name}")
+                save_gt_vs_recon_images(save_recons, recons_dir)
+
+                # 결과를 텍스트 파일로 저장 (test set별로)
+                result_path = os.path.join(args.root_dir, args.code_dir, args.output_dir, f"mindeye1_metrics_{epoch}_{experiment_name}_{test_name}.txt")
+                result_path = get_unique_path(result_path)
+                with open(result_path, "w") as f:
+                    f.write(f"Test Set: {test_name}\n")
+                    f.write(f"Num Samples: {len(all_recons)}\n")
+                    f.write(f"="*50 + "\n")
+                    for name, score in results.items():
+                        f.write(f"{name}: {score:.4f}\n")
+                print(f"Results saved to {result_path}\n")
+
+                # 메모리 정리 - 중요!
+                del all_recons, all_targets, save_recons, results
+                torch.cuda.empty_cache() # gpu 메모리 cache삭제
+                gc.collect() # cpu + gpu 메모리 안 쓰는거 삭제
+                print(f"[{test_name}] Memory cleared.\n")
             
 def low_train_inference_evaluate(args, train_data, test_data, models, optimizer, lr_scheduler, metrics):
 

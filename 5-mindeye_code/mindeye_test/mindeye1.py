@@ -757,10 +757,10 @@ def get_model_lowlevel(args):
 def get_model_highlevel(args):
 
     if args.subj == 1:
-        # num_voxels = 15724
-        num_voxels = 17355
-        # num_voxels = 11904
-        # num_voxels = 101319
+        # num_voxels = 15724  # beta_huggingface
+        # num_voxels = 101319  # beta_mni / beta_mni_1mm
+        # num_voxels = 11904  # connectomind2_v2
+        num_voxels = 17355  # connectomind2
     elif args.subj == 2:
         num_voxels = 14278
     elif args.subj == 3:
